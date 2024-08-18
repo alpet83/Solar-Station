@@ -1,0 +1,19 @@
+{
+    "device_class":"temperature",
+    "state_topic":"homeassistant/sensor/solar_station_inv/state",
+    "state_class":"measurement",
+    "unit_of_measurement":"°C",
+    "value_template":"{{ value_json.temperature }}",
+    "unique_id":"temp01xxxzzz",
+    "device":{
+       "identifiers":[
+           "inverter"
+       ],
+       "name":"Solar Station / Inverter",
+       "manufacturer": "MUST EE",
+       "model": "PV18-5048VHM",
+       "serial_number": "VPV185048202402240024",
+       "hw_version": "1.00.01",
+       "configuration_url": "https://localhost"
+    }
+}

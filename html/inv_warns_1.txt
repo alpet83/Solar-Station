@@ -1,0 +1,17 @@
+Fan is locked when inverter is on.
+Fan2 is locked when inverter is on.
+Battery is over-charged.
+Low battery
+Overload
+Output power derating
+Solar charger stops due to low battery.
+Solar charger stops due to high PV voltage.
+Solar charger stops due to over load.
+Solar charger over temperature
+PV charger communication error 
+reserved
+reserved
+reserved
+reserved
+reserved
+

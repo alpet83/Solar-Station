@@ -1,0 +1,19 @@
+{
+    "device_class":"temperature",
+    "state_topic":"homeassistant/sensor/solar_station_jkbms/state",
+    "state_class":"measurement",
+    "unit_of_measurement":"°C",
+    "value_template":"{{ value_json.temperature }}",
+    "unique_id":"temp01ae",
+    "device":{
+       "identifiers":[
+           "jkbms"
+       ],
+       "name":"Solar Station / BMS",
+       "manufacturer": "Ji Kong",
+       "model": "JK-PB2A16S20P",
+       "serial_number": "130024",
+       "hw_version": "1",
+       "configuration_url": "https://localhost"
+    }
+}

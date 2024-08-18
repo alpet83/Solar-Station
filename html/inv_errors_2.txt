@@ -1,0 +1,16 @@
+Inverter radiator over temperature
+Solar charger battery voltage class error
+Solar charger current sensor error
+Solar charger current is uncontrollable
+Inverter grid voltage is low
+Inverter grid voltage is high
+Inverter grid under frequency
+Inverter grid over frequency
+Inverter over current protection error
+Inverter bus voltage is too low
+Inverter soft start failed
+Over DC voltage in AC output
+Battery connection is open
+Inverter control current sensor error
+Inverter output voltage is too low
+

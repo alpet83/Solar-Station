@@ -1,0 +1,17 @@
+Fan is locked when inverter is off
+Inverter transformer over temperature
+battery voltage is too high
+battery voltage is too low
+Output short circuited
+Inverter output voltage is high
+Overload time out
+Inverter bus voltage is too high
+Bus soft start failed
+Main relay failed
+Inverter output voltage sensor error
+Inverter grid voltage sensor error
+Inverter output current sensor error
+Inverter grid current sensor error
+Inverter load current sensor error
+Inverter grid over current error
+

@@ -1,0 +1,17 @@
+{       
+    "command_topic":"homeassistant/switch/solar_station_jkbms/set",
+    "state_topic":"homeassistant/switch/solar_station_jkbms/state",        
+    "unique_id":"switch_bla_bla",
+    "name":"device_switch",    
+    "device":{
+       "identifiers":[
+           "jkbms"
+       ],
+       "name":"Solar Station / BMS control",
+       "manufacturer": "Ji Kong",
+       "model": "JK-PB2A16S20P",
+       "serial_number": "130024",
+       "hw_version": "1",
+       "configuration_url": "https://localhost"
+    }
+}
