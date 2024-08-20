@@ -24,12 +24,11 @@
   $ts = date('Y-m-d H:i:s');
   $tm = date("H:i");
   
-  $json = file_get_contents('/tmp/jkbms_last.json');
-  $obj = json_decode($json);
+  $obj = file_load_json('/tmp/jkbms_last.json');  
   if (is_object($obj) && isset($obj->ts)) 
      log_msg("#DBG: processing data from ".$obj->ts);
   else 
-     die ("#FATAL: failed decode $json\n");
+     die ("#FATAL: failed decode BMS data: \n".var_export($obj, true));
 
   $dtd = new DateTime($obj->ts);
   $diff = $dt->diff($dtd);
@@ -50,11 +49,14 @@
     $v_avg += $v;
     $count ++;
   }
+  $inv = file_load_json('/tmp/inverter_cfg.json');
+  $accum = file_load_json('/tmp/inverter_accum.json');  
+  $delta = $accum->load_power - $accum->buy_power + $accum->sell_power;
   $info = sprintf("voltage = %.1fV, current = %.1fA, SoC = %.1f%%\n", $obj->battery_voltage, $obj->battery_current, $obj->battery_SoC);
 
   if ($count > 0) {
     $v_avg /= $count;
-    $info .= sprintf("cells voltage [min = %.3fV, max = %.3fV, average = %.3fV]\n", $v_min, $v_max, $v_avg);    
+    $info .= sprintf("cells voltage [min = %.3fV, max = %.3fV, average = %.3fV], energy = $delta kWh\n", $v_min, $v_max, $v_avg);    
     if ($v_min < 2.7)
        send_event('ALERT', "Low voltage on cell = $v_min");
     if ($v_min > 3.6)
@@ -69,19 +71,18 @@
     send_event('ALERT', "Abnormal high current on {$obj->device_id} = {$obj->battery_current}");
   }
   $bpow = $obj->battery_voltage * $obj->battery_current;
-  $json = file_get_contents('/tmp/inverter_cfg.json');
-  $inv = json_decode($json);
+  
   if (is_object($inv) && isset($inv->config)) {
     $cfg = $inv->config;
-    if (0 == $cfg->ongrid_switch && $v_min <= 3.15) {
-       $event = "Battery near discharge (v_min = $v_min, SoC = {$obj->battery_SoC}%, power = $bpow), switching invertor ON-Grid";
+    if (0 == $cfg->ongrid_switch && $v_min <= 3.15) {       
+       $event = "Battery near discharge (v_min = $v_min, SoC = {$obj->battery_SoC}%, power = $bpow, energy = $delta kWh), switching invertor ON-Grid";
        send_event('WARN', $event);
        file_add_contents('/dev/kmsg', $event);
        file_put_contents('/root/inverter_cmd.lst', '20105=>1');
     }
     
-    if (1 == $cfg->ongrid_switch && ($v_min >= 3.3 && $bpow >= 900 || $v_min > 3.35)) {
-       $event = "Battery precharged (v_min = $v_min, SoC = {$obj->battery_SoC}%, power = $bpow, switching invertor OFF-Grid";
+    if (1 == $cfg->ongrid_switch && ($v_min >= 3.35 && $bpow >= 900 || $v_min > 3.35)) {
+       $event = "Battery precharged (v_min = $v_min, SoC = {$obj->battery_SoC}%, power = $bpow, energy = $delta kWh), switching invertor OFF-Grid";
        send_event('WARN', $event); 
        file_add_contents('/dev/kmsg', $event);
        file_put_contents('/root/inverter_cmd.lst', '20105=>0');

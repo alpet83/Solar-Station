@@ -39,7 +39,9 @@ def read_regs(addr, count):
     time.sleep(0.3)  # tx separation delay
     if client:
         for attempt in range(5):
+            log.setLevel(logging.ERROR)  # prevent spam about noise bytes from parallel client request
             rr = client.read_holding_registers(addr, count, slave=SLAVE_ID)
+            log.setLevel(logging.NOTSET)
             if rr.isError():
                 log.warning(f" ({attempt}) read_holding_registers failed {count}@{addr}")
                 time.sleep(0.5)
@@ -217,8 +219,8 @@ def parse_cmds():
             process_cmd(line)
 
 
-calibration_params = ['9:batt_voltage', '10:inv_voltage', '11:grid_voltage', '12:bus_voltage', '13:ctrl_current',
-                      '14:inv_current', '15:grid_current']
+calibration_params = ['9:batt_voltage:i', '10:inv_voltage:i', '11:grid_voltage:i', '12:bus_voltage:i',
+                      '13:ctrl_current:i', '14:inv_current:i', '15:grid_current:i']
 config_params = ['0:offgrid_work', '1:output_volt:1', '2:output_freq:2', '3:search_mode', '4:ongrid_switch',  # 5-6?
                  '7:dischg_to_grid', '8:energy_use_mode', '10:grid_prot_std', '11:solar_use_aim', '12:max_dis_current:1',
                  '17:batt_stop_dis:1', '18:batt_stop_chg:1', '24:grid_max_chg_curr:1', '26:batt_low_volt:1',
@@ -279,7 +281,7 @@ def using_pymodbus():
         registers = read_regs(ADDR, 1)
         if registers:
             midx = registers[0]
-            log.debug(f" machine idx = {midx}\n")
+            log.info(f" machine idx = {midx}\n")
             if midx == PV1800_ID:
                 result = read_loop()
         else:
@@ -302,7 +304,7 @@ def using_mini():
     # instr.clear_buffers_before_each_transaction = True
     instr.mode = minimalmodbus.MODE_RTU
     midx = instr.read_register(ADDR)
-    log.debug(f"Machine index = {midx}\n")
+    log.info(f"Machine index = {midx}\n")
     if midx == PV1800_ID:
         return read_loop()
     # instr.close()
@@ -311,8 +313,6 @@ def using_mini():
 if __name__ == "__main__":
     time.sleep(1)  # datalogger conflict prevention with crontab usage
     #
-    if using_pymodbus():
-        log.debug("#OK")
-    else:
-       using_mini()
+    if not using_pymodbus():
+        using_mini()
 
