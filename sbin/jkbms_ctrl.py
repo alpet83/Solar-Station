@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-
+import logging
 import time
 import json
 import argparse
@@ -21,6 +21,7 @@ def crcJK232(byteData):
 
 
 ## Vars ################
+signature = "4e57"
 port = "/dev/ttyUSB0"
 baud = 115200
 read_all = b'\x4E\x57\x00\x13\x00\x00\x00\x00\x06\x03\x00\x00\x00\x00\x00\x00\x68\x00\x00\x01\x29'
@@ -162,8 +163,8 @@ def decode_response(response):
   if rlen < 16:
     return "nope";
   stx = response[0:2].hex()
-  if stx != "4e57": 
-    return "unknown signature " + stx;
+  if stx != signature:
+    return "unknown signature 0x" + stx;
   pklen = bytes2int(response[2:4])
   bms_id = bytes2hex(response[4:8])
 #  4e57012100000000060001
@@ -172,7 +173,9 @@ def decode_response(response):
   packet['cells'] = {}
   packet['bms_params'] = {}
   response = response[11:]  # skip header
+  code = 0
   while len(response) >= 5:
+    prev_code = code
     code = bytes2int(response[0:1])
     bms_pv = False
     num_sz = 2
@@ -227,9 +230,12 @@ def decode_response(response):
     elif code == 0xba:
         packet['id_manufact'], response = decode_str(response, 24)
     else:
-      packet['last_code'] = code
-      packet['tail'] = response.hex()
-      break
+      tail = response.hex()
+      if (code == 78) and (tail.find(signature) <= 1):
+         print("#WARN: probable double response in packet")
+         return decode_response(response)
+
+      return f"#WARN: breaking decode with tail {tail}, previous code = {prev_code}"
   
 
 #  for defn in response_map:
@@ -276,35 +282,44 @@ with serial.serial_for_url(port, baud) as s:
 
     for _ in range(7):
         #            response_line = s.readline().hex()
-        response = s.read(size=300)
+        response = s.read(size=291)
         response_line = response.hex()
         if len(response) == 0:
             if len(accum) >= 5:
                 break
             s.write(rqs)
             continue
-        print(f"Got response: {response_line}")
+        rl = len(response)
+        print(f"Got response: {response_line} = {rl}")
         dec = decode_response(response)
-        print(f"decoded: {dec}")
-        accum.append(dec)
+        if type(dec) is str:
+            print(f"#WARN(wrong decode): {dec}")
+        else:
+            print(f"#ACCUM: {dec}")
+            accum.append(dec)
 
-    avg = {}
+    avg_count = {'battery_voltage': 0, 'battery_current': 0}
     avg_params = {'battery_voltage': 2, 'battery_current': 2}
+    avg = avg_count.copy()  # init zeros
     count = 0
+
     for list in accum:
         count += 1
         for key in list.keys():
-            if count > 1:
-                if key in avg_params.keys():
-                    avg[key] += list[key]
+            if (key in avg_params.keys()) and (key in list.keys()):
+                avg[key] += list[key]
+                avg_count[key] += 1
             else:
                 avg[key] = list[key]
+
     if count > 1:
         print(f" using {count} samples to calc. average values...\n")
         for key in avg_params.keys():
-            avg[key] = round(avg[key] / count, avg_params[key])  # average samples
+            avg[key] = round(avg[key] / avg_count[key], avg_params[key])  # average samples
+    else:
+        print(f"#ERROR: loaded {count} samples")
 
-    if save_res:
+    if save_res and (count > 0):
         jss = json.dumps(avg)
         jss = jss.replace("\x00", ".")
         jss = jss.replace("\\u0000", ".")

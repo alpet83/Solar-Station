@@ -183,9 +183,10 @@ def process_cmd(cmd):
     if len(pair) == 2:
         addr = int(pair[0])
         val = int(pair[1])
-        if (addr >= 20002) and (addr <= 20144):
-            now = datetime.now()
-            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        # note: contrary to protocol documentation 10001-10008 is read-only registers
+        if ((addr >= 10101) and (addr <= 10124)) or ((addr >= 20002) and (addr <= 20144)):
             print(f"#CMD: trying set [{addr}] = {val}")
             result = 'FAIL'
             for attempt in range(10):
@@ -207,6 +208,9 @@ def process_cmd(cmd):
                 cmdl.write(f"[{ts}] {cmd} = {result}\n")  # log processed command
         else:
             print(f"#ERROR: outrange address value = {addr} for write op")
+            with open(CMD_FILE + '.log', "a") as cmdl:
+                cmdl.write(f"[{ts}] {cmd} ignored due out of range\n")  # log processed command
+
 
 
 def parse_cmds():

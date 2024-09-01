@@ -145,7 +145,7 @@
         $bms_ts = $bms->ts;
     }   
     function publish_inverter() {
-        global $mqtt, $root, $sws_desc, $inv_cfg, $pvc_ws_desc, $chg_st_desc, $MPPT_st_desc, $inv_ts;
+        global $mqtt, $root, $sws_desc, $inv_cfg, $pvc_ws_desc, $chg_st_desc, $MPPT_st_desc, $inv_ts, $minute;
         $inv = file_load_json('/tmp/inverter_last.json');
         if (!is_object($inv)) {
             log_cmsg("~C91#ERROR:~C00 can't load invertor data");
@@ -199,6 +199,10 @@
                     'accu_gen_power' => $accu->load_power - $accu->buy_power + $accu->sell_power];
             $sensors = array_merge($sensors, $map);                    
         }
+        foreach ($sensors as $key => $val) 
+         if (false !== strpos($key, 'power') && 0 == $val)
+             if (0 == $minute % 10) 
+               $sensors[$key] = 0.1;  // randomize value for prevent Grafana stuck
         $json = json_encode($sensors);
         log_cmsg("~C97#PUB:~C00 $json");
         $mqtt->publish(SENSOR_PATH."_inv/state", $json);
@@ -235,6 +239,7 @@
     $bms_ts = '';
     $inv_ts = '';
     $creds = 'user password';
+    $minute = date('i');
 
     try {        
         $mqtt = new MqttClient($server, $port, $clientId, MqttClient::MQTT_3_1, null);
@@ -250,8 +255,7 @@
             ->setPassword($pass);
 
         log_cmsg("~C92 #DBG:~C00 trying connect...");
-        $mqtt->connect($connectionSettings, true);
-        $minute = date('i');
+        $mqtt->connect($connectionSettings, true);        
         $factory = new MQTTConfigFactory('bms_sensor.json', 'JKBMS');
         $root = SENSOR_PATH.'_jkbms';
         $factory->set_device('temperature');
