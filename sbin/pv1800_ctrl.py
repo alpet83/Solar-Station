@@ -7,6 +7,8 @@ import os
 import minimalmodbus
 from pymodbus.client import ModbusSerialClient as ModbusClient
 from pymodbus.framer import ModbusRtuFramer
+# for pymodbus 3.8.0 uncomment next and remove line above
+# from pymodbus.framer import FramerRTU
 from datetime import datetime
 import logging
 FORMAT = ('%(asctime)-15s %(threadName)-15s '
@@ -40,7 +42,7 @@ def read_regs(addr, count):
     if client:
         for attempt in range(5):
             log.setLevel(logging.ERROR)  # prevent spam about noise bytes from parallel client request
-            rr = client.read_holding_registers(addr, count, slave=SLAVE_ID)
+            rr = client.read_holding_registers(addr, count=count, slave=SLAVE_ID)
             log.setLevel(logging.NOTSET)
             if rr.isError():
                 log.warning(f" ({attempt}) read_holding_registers failed {count}@{addr}")
