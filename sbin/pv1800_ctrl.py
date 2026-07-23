@@ -24,7 +24,7 @@ encoder.FLOAT_REPR = lambda o: format(o, '.3f')
 client = None  # WARN: global object instance of ModbusSerialClient
 instr = None   # WARN: global object instance of minimalmodbus.Instrument
 SLAVE_ID = 0x04
-DEVICE = '/dev/ttyACM0'
+DEVICE = '/dev/ttyINV0'  # stable udev alias, see etc/udev-rules/91-solar-station.rules
 BAUDRATE = 19200
 CMD_FILE = '/root/inverter_cmd.lst'
 ADDR = 20000
@@ -56,6 +56,7 @@ def read_regs(addr, count):
         assert not rr.isError(), f"#FATAL: can't read registers {count}@{addr}"
     if instr:
         result = instr.read_registers(addr, count)
+        return result
     return False
 
 
@@ -93,7 +94,7 @@ def calc_p(data, key):
     s = data['S'][key]
     q = data['Q'][key]
     if data['power'][key] == 0:  # in case firmware not handle selling power to grid
-        return math.sqrt(s * s - q * q)
+        return math.sqrt(max(0, s * s - q * q))
     return data['power'][key]
 
 
@@ -181,37 +182,41 @@ def scan_realtime():
 
 
 def process_cmd(cmd):
-    pair = cmd.split('=>')
-    if len(pair) == 2:
-        addr = int(pair[0])
-        val = int(pair[1])
-        now = datetime.now()
-        ts = now.strftime("%Y-%m-%d %H:%M:%S")
-        # note: contrary to protocol documentation 10001-10008 is read-only registers
-        if ((addr >= 10101) and (addr <= 10124)) or ((addr >= 20002) and (addr <= 20144)):
-            print(f"#CMD: trying set [{addr}] = {val}")
-            result = 'FAIL'
-            for attempt in range(10):
-                w = 'OK'
-                if client:
-                    w = client.write_register(addr, val, slave=SLAVE_ID)
-                elif instr:
-                    w = instr.write_register(add, val)
-                registers = read_regs(addr, 1);
-                if registers and (registers[0] == val):
-                    result = 'OK'
-                    break
-                else:
-                    sv = registers[0]
-                    log.warning(f"({attempt}) failed write [{addr}] = {val}, stored {sv}, result = {w}")
-                    time.sleep(1)
+    try:
+        pair = cmd.split('=>')
+        if len(pair) == 2:
+            addr = int(pair[0])
+            val = int(pair[1])
+            now = datetime.now()
+            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            # note: contrary to protocol documentation 10001-10008 is read-only registers
+            if ((addr >= 10101) and (addr <= 10124)) or ((addr >= 20002) and (addr <= 20144)):
+                print(f"#CMD: trying set [{addr}] = {val}")
+                result = 'FAIL'
+                for attempt in range(10):
+                    w = 'OK'
+                    if client:
+                        w = client.write_register(addr, val, slave=SLAVE_ID)
+                    elif instr:
+                        w = instr.write_register(addr, val)
+                    registers = read_regs(addr, 1);
+                    if registers and (registers[0] == val):
+                        result = 'OK'
+                        break
+                    else:
+                        sv = registers[0]
+                        log.warning(f"({attempt}) failed write [{addr}] = {val}, stored {sv}, result = {w}")
+                        time.sleep(1)
 
-            with open(CMD_FILE + '.log', "a") as cmdl:
-                cmdl.write(f"[{ts}] {cmd} = {result}\n")  # log processed command
-        else:
-            print(f"#ERROR: outrange address value = {addr} for write op")
-            with open(CMD_FILE + '.log', "a") as cmdl:
-                cmdl.write(f"[{ts}] {cmd} ignored due out of range\n")  # log processed command
+                with open(CMD_FILE + '.log', "a") as cmdl:
+                    cmdl.write(f"[{ts}] {cmd} = {result}\n")  # log processed command
+            else:
+                print(f"#ERROR: outrange address value = {addr} for write op")
+                with open(CMD_FILE + '.log', "a") as cmdl:
+                    cmdl.write(f"[{ts}] {cmd} ignored due out of range\n")  # log processed command
+    except Exception as e:
+        log.warning(f"#CMD: failed to process command line `{cmd}`: {e}")
+        return
 
 
 
@@ -222,7 +227,10 @@ def parse_cmds():
         data = cmdf.read().splitlines()
         os.remove(CMD_FILE)
         for line in data:
-            process_cmd(line)
+            try:
+                process_cmd(line)
+            except Exception as e:
+                log.warning(f"#CMD: unexpected error processing line `{line}`: {e}")
 
 
 calibration_params = ['9:batt_voltage:i', '10:inv_voltage:i', '11:grid_voltage:i', '12:bus_voltage:i',
@@ -230,7 +238,7 @@ calibration_params = ['9:batt_voltage:i', '10:inv_voltage:i', '11:grid_voltage:i
 config_params = ['0:offgrid_work', '1:output_volt:1', '2:output_freq:2', '3:search_mode', '4:ongrid_switch',  # 5-6?
                  '7:dischg_to_grid', '8:energy_use_mode', '10:grid_prot_std', '11:solar_use_aim', '12:max_dis_current:1',
                  '17:batt_stop_dis:1', '18:batt_stop_chg:1', '24:grid_max_chg_curr:1', '26:batt_low_volt:1',
-                 '26:batt_high_volt:1', '31:max_comb_chg_curr:1', '41:system_setting', '42:chg_source_prio',
+                 '27:batt_high_volt:1', '31:max_comb_chg_curr:1', '41:system_setting', '42:chg_source_prio',
                  '43:solar_power_bal']
 charger_params = ['0:machine_id', '3:hw_ver', '4:sw_ver', '5:pv_volt_calib', '6:bt_volt_calib', '7:curr_calib']
 batt_params = ['2:float_volt:1', '3:absorb_volt:1', '4:batt_low_volt:1', '6:batt_high_volt:1', '7:pv_max_chg_curr:1',
@@ -269,8 +277,11 @@ def read_loop():
     with open('/tmp/inverter_cfg.json', 'w') as f:
         f.write(jss)
     while time.time() % 60 < 50:
-        scan_realtime()
-        parse_cmds()
+        try:
+            scan_realtime()
+            parse_cmds()
+        except Exception:
+            log.exception("#ERROR: unhandled exception in read_loop iteration, continuing")
         time.sleep(5)
     return True
 

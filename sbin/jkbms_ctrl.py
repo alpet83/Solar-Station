@@ -3,8 +3,12 @@ import logging
 import time
 import json
 import argparse
+import sys
 import serial
 from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger(__name__)
 
 def crcJK232(byteData):
     """
@@ -22,7 +26,7 @@ def crcJK232(byteData):
 
 ## Vars ################
 signature = "4e57"
-port = "/dev/ttyUSB0"
+port = "/dev/ttyBMS0"  # stable udev alias, see etc/udev-rules/91-solar-station.rules
 baud = 115200
 read_all = b'\x4E\x57\x00\x13\x00\x00\x00\x00\x06\x03\x00\x00\x00\x00\x00\x00\x68\x00\x00\x01\x29'
 # for id=1 b'\x4E\x57\x00\x13\x00\x00\x00\x01\x06\x03\x00\x00\x00\x00\x00\x00\x68\x00\x00\x01*'
@@ -79,7 +83,7 @@ bms_params = [[0x8e, 2, "total_OVP", 0.01],
               [0xab, 1, "chg_MOS_switch", 1],
               [0xac, 1, "dis_MOS_switch", 1],
               [0xad, 1, "prot_board_addr", 1],
-              [0xad, 2, "current_calibr", 0.001],
+              # NOTE: removed duplicate/unreachable 0xad entry for "current_calibr" - conflicted with prot_board_addr above and was never decoded; if current_calibr's real register code is known, re-add it with the correct code
               [0xae, 1, "prot_board_addr", 1],
               [0xaf, 1, "battery_type", 1],
               [0xb0, 2, "sleep_wait", 1],
@@ -221,6 +225,7 @@ def decode_response(response):
       packet['bms_params'][bms_pv],response = decode_num(response, coef, num_sz)
     elif code == 0xb2:
         bms_pwd, response = decode_str(response, 10)
+        print(f"BMS PWD: {bms_pwd}")
     elif code == 0xb4:
         packet['device_id'], response = decode_str(response, 8)
     elif code == 0xb5:
@@ -247,83 +252,92 @@ def decode_response(response):
 #      responses.append(response)     
   return packet
 
-with serial.serial_for_url(port, baud) as s:
-    s.timeout = 1
-    s.write_timeout = 1
-    s.flushInput()
-    s.flushOutput()
-    # rqs = format_rqs(3, '\xb1')  # set low capacity alarm level to 30?
-    # bytes_written = s.write(rqs)
-    # print(f"  write request {rqs}, sent {bytes_written} bytes\n")
-    rqs = read_all
-    parser = argparse.ArgumentParser(description='Interact with JKBMS by RS485 protocol V2.5')
-    parser.add_argument('--cmd', metavar='CMD', type=int, default=0, required=False,
-                        help='1,2,3,5,6 - activate, write, read, update, read_all')
-    parser.add_argument('--id', metavar='ID', type=int, default=0, required=False,
-                        help="00, 0x79-0xba - parameter selector for r/w/u")
-    parser.add_argument('--value', metavar='VALUE', type=str, default='', required=False,
-                        help="HEX bytes string for rewrite parameter")
-    parser.add_argument('--bms_id', metavar='bms_id', type=int, default=0, required=False,
-                        help="BMS ID on bus, for selection (0 = all)")
-    args = parser.parse_args()
-    save_res = True
-    if (args.cmd >= 1) and (args.cmd <= 6):
-        save_res = False
-        rqs = format_rqs(args.cmd, f"{args.id:02x}" + args.value, args.bms_id)
-        seconds = time.localtime().tm_sec
-        if seconds < 10:
-            print("collision delay, wait...\n")
-            time.sleep(10 - seconds)
-    rqs_hex = rqs.hex()
-    print(f"sending command {rqs}:{rqs_hex} ")
-    bytes_written = s.write(rqs)
-    print(f"wrote {bytes_written} bytes\n")
-    accum = []
+if __name__ == "__main__":
+    try:
+        with serial.serial_for_url(port, baud) as s:
+            s.timeout = 1
+            s.write_timeout = 1
+            s.flushInput()
+            s.flushOutput()
+            # rqs = format_rqs(3, '\xb1')  # set low capacity alarm level to 30?
+            # bytes_written = s.write(rqs)
+            # print(f"  write request {rqs}, sent {bytes_written} bytes\n")
+            rqs = read_all
+            parser = argparse.ArgumentParser(description='Interact with JKBMS by RS485 protocol V2.5')
+            parser.add_argument('--cmd', metavar='CMD', type=int, default=0, required=False,
+                                help='1,2,3,5,6 - activate, write, read, update, read_all')
+            parser.add_argument('--id', metavar='ID', type=int, default=0, required=False,
+                                help="00, 0x79-0xba - parameter selector for r/w/u")
+            parser.add_argument('--value', metavar='VALUE', type=str, default='', required=False,
+                                help="HEX bytes string for rewrite parameter")
+            parser.add_argument('--bms_id', metavar='bms_id', type=int, default=0, required=False,
+                                help="BMS ID on bus, for selection (0 = all)")
+            args = parser.parse_args()
+            save_res = True
+            if (args.cmd >= 1) and (args.cmd <= 6):
+                save_res = False
+                rqs = format_rqs(args.cmd, f"{args.id:02x}" + args.value, args.bms_id)
+                seconds = time.localtime().tm_sec
+                if seconds < 10:
+                    print("collision delay, wait...\n")
+                    time.sleep(10 - seconds)
+            rqs_hex = rqs.hex()
+            print(f"sending command {rqs}:{rqs_hex} ")
+            bytes_written = s.write(rqs)
+            print(f"wrote {bytes_written} bytes\n")
+            accum = []
 
-    for _ in range(7):
-        #            response_line = s.readline().hex()
-        response = s.read(size=291)
-        response_line = response.hex()
-        if len(response) == 0:
-            if len(accum) >= 5:
-                break
-            s.write(rqs)
-            continue
-        rl = len(response)
-        print(f"Got response: {response_line} = {rl}")
-        dec = decode_response(response)
-        if type(dec) is str:
-            print(f"#WARN(wrong decode): {dec}")
-        else:
-            print(f"#ACCUM: {dec}")
-            accum.append(dec)
+            for _ in range(7):
+                #            response_line = s.readline().hex()
+                response = s.read(size=291)
+                response_line = response.hex()
+                if len(response) == 0:
+                    if len(accum) >= 5:
+                        break
+                    if save_res:
+                        s.write(rqs)
+                    else:
+                        print("#WARN(timeout): no response to write/activate/update command, "
+                              "NOT resending it automatically - check the bus manually\n")
+                    continue
+                rl = len(response)
+                print(f"Got response: {response_line} = {rl}")
+                dec = decode_response(response)
+                if type(dec) is str:
+                    print(f"#WARN(wrong decode): {dec}")
+                else:
+                    print(f"#ACCUM: {dec}")
+                    accum.append(dec)
 
-    avg_count = {'battery_voltage': 0, 'battery_current': 0}
-    avg_params = {'battery_voltage': 2, 'battery_current': 2}
-    avg = avg_count.copy()  # init zeros
-    count = 0
+            avg_count = {'battery_voltage': 0, 'battery_current': 0}
+            avg_params = {'battery_voltage': 2, 'battery_current': 2}
+            avg = avg_count.copy()  # init zeros
+            count = 0
 
-    for list in accum:
-        count += 1
-        for key in list.keys():
-            if (key in avg_params.keys()) and (key in list.keys()):
-                avg[key] += list[key]
-                avg_count[key] += 1
+            for list in accum:
+                count += 1
+                for key in list.keys():
+                    if (key in avg_params.keys()) and (key in list.keys()):
+                        avg[key] += list[key]
+                        avg_count[key] += 1
+                    else:
+                        avg[key] = list[key]
+
+            if count > 1:
+                print(f" using {count} samples to calc. average values...\n")
+                for key in avg_params.keys():
+                    avg[key] = round(avg[key] / avg_count[key], avg_params[key])  # average samples
             else:
-                avg[key] = list[key]
+                print(f"#ERROR: loaded {count} samples")
 
-    if count > 1:
-        print(f" using {count} samples to calc. average values...\n")
-        for key in avg_params.keys():
-            avg[key] = round(avg[key] / avg_count[key], avg_params[key])  # average samples
-    else:
-        print(f"#ERROR: loaded {count} samples")
-
-    if save_res and (count > 0):
-        jss = json.dumps(avg)
-        jss = jss.replace("\x00", ".")
-        jss = jss.replace("\\u0000", ".")
-        with open('/tmp/jkbms_last.json','w') as f:
-            f.write(jss)
-        with open('/tmp/jkbms_stats.json','a') as f:
-            f.write(jss + "\n")
+            if save_res and (count > 0):
+                jss = json.dumps(avg)
+                jss = jss.replace("\x00", ".")
+                jss = jss.replace("\\u0000", ".")
+                with open('/tmp/jkbms_last.json','w') as f:
+                    f.write(jss)
+                with open('/tmp/jkbms_stats.json','a') as f:
+                    f.write(jss + "\n")
+    except Exception as e:
+        log.exception("jkbms_ctrl failed: %s", e)
+        sys.exit(1)

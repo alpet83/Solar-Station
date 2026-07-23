@@ -1,0 +1,17 @@
+# Стабильные имена устройств для RS485/USB-адаптеров и сопутствующей периферии Solar-Station.
+# Устанавливать в /etc/udev/rules.d/91-solar-station.rules и перечитывать:
+#   udevadm control --reload-rules && udevadm trigger
+#
+# Без этого файла порядок появления /dev/ttyUSB*/ttyACM* зависит от очерёдности
+# перечисления USB при загрузке и может меняться между перезагрузками, особенно
+# если на хосте есть другие USB-serial устройства (см. docs/03-configuration.md).
+
+# JKBMS (CH340, RS485) - единственный адаптер с этим vendor:product на шине
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="ttyBMS0"
+
+# Инвертор PV1800 (USB Single Serial, CH9102-семейство) - фиксируем по serial,
+# т.к. второй адаптер того же vendor:product (1a86) уже занят под ttyBMS0
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="545C052358", SYMLINK+="ttyINV0"
+
+# GPS/GNSS приёмник (u-blox 7) - чтобы не занимал /dev/ttyACM0 и не конфликтовал с инвертором
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", ATTRS{idProduct}=="01a7", SYMLINK+="ttyGPS0"

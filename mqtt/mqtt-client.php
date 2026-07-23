@@ -231,8 +231,8 @@
         }
         log_cmsg("~C93#DBG:~C00 switch_set~C92 $topic~C95 =>~C92 $message~C00");
         $addr = $addrs[$id];
-        $val = strpos($message, 'ON') !== false;
-        file_put_contents('/root/inverter_cmd.lst', "$addr=>$val");
+        $val = (strpos($message, 'ON') !== false) ? 1 : 0;
+        file_put_contents('/root/inverter_cmd.lst', "$addr=>$val\n", FILE_APPEND);
     } // on_switch_set
 
 
