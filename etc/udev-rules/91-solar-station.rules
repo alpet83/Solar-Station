@@ -13,5 +13,7 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="t
 # т.к. второй адаптер того же vendor:product (1a86) уже занят под ttyBMS0
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="545C052358", SYMLINK+="ttyINV0"
 
-# GPS/GNSS приёмник (u-blox 7) - чтобы не занимал /dev/ttyACM0 и не конфликтовал с инвертором
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", ATTRS{idProduct}=="01a7", SYMLINK+="ttyGPS0"
+# При наличии на хосте другой USB-serial периферии (сторонние датчики, модемы
+# и т. п.) стоит завести для неё аналогичное правило по своим idVendor/idProduct
+# (и, если vendor:product не уникален на шине, ещё и по serial) - иначе она может
+# случайно занять /dev/ttyACM0/ttyUSB0 раньше BMS/инвертора при следующей загрузке.
