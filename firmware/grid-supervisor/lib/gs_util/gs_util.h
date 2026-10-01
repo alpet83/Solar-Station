@@ -48,6 +48,9 @@ struct StateView {
 // JSON состояния. Время — UTC: epoch в "t" и ISO в "ts" (только если epoch_s >= 0).
 size_t state_to_json(const StateView& s, char* out, size_t cap);
 
+// JSON ответа /api/regs: {"addr":..,"count":..,"age_ms":..,"regs":[..]}. 0 — не влезло в буфер.
+size_t regs_to_json(uint16_t addr, uint16_t count, uint64_t age_ms, const uint16_t* regs, char* out, size_t cap);
+
 // Разбор значения внешнего тока ("12.5"): true и [0..500] при корректном вводе.
 bool parse_ext_current(const char* s, float& out);
 

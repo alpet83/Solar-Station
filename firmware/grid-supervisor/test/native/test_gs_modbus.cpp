@@ -92,6 +92,19 @@ int main() {
         auto part = f; part.resize(part.size() - 3);
         CHECK(scan_read(part.data(), part.size(), 4, 0x03, 5, o.data()) != Rx::Ok);
     }
+    {
+        RegCache rc; uint16_t a[79], o[79]; for (int i = 0; i < 79; ++i) a[i] = 1000 + i;
+        CHECK(rc.store(25201, 79, a, 5000));
+        CHECK(rc.lookup(25205, 1, 8000, o, nullptr) == true && o[0] == 1004);
+        uint64_t age = 0; CHECK(rc.lookup(25201, 79, 8000, o, &age) && age == 3000 && o[78] == 1078);
+        CHECK(!rc.lookup(25201, 80, 8000, o, nullptr));            // выходит за блок
+        CHECK(!rc.lookup(25200, 2, 8000, o, nullptr));
+        CHECK(!rc.lookup(20105, 1, 8000, o, nullptr));
+        CHECK(rc.store(25201, 79, a, 9000) && rc.lookup(25201, 1, 9500, o, &age) && age == 500);   // обновление на месте
+        for (int i = 0; i < 20; ++i) rc.store((uint16_t)(100 + i), 1, a, 1);
+        int used = 0; for (auto& b : rc.blocks) used += b.valid; CHECK(used == (int)kMaxBlocks);   // переполнение не портит
+        CHECK(!rc.store(1, 81, a, 1));
+    }
     printf("modbus: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

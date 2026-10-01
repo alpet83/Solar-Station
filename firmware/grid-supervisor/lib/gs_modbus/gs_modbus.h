@@ -78,4 +78,18 @@ void decode_cfg(const uint16_t* regs, Telemetry& t);   // 44 слова с 20101
 Input make_input(const Telemetry& t, uint64_t now_ms, bool safe_mode,
                  float ext_charge_a, uint64_t ext_age_ms);
 
+// Кэш последних прочитанных блоков регистров — отдаётся наружу как есть (/api/regs), чтобы
+// Pi-сторона (pv1800_ctrl.py) могла разбирать блоки прежним кодом, не трогая шину.
+constexpr size_t kMaxBlocks = 8;
+constexpr uint16_t kMaxBlockRegs = 80;
+struct RegBlock { uint16_t addr = 0, count = 0; uint16_t regs[kMaxBlockRegs] = {0}; uint64_t at_ms = 0; bool valid = false; };
+
+struct RegCache {
+    RegBlock blocks[kMaxBlocks];
+    // Сохраняет блок (обновляет существующий с тем же addr/count или занимает свободный слот).
+    bool store(uint16_t addr, uint16_t count, const uint16_t* regs, uint64_t now_ms);
+    // Ищет запрошенный диапазон целиком внутри одного валидного блока. age_ms — возраст блока.
+    bool lookup(uint16_t addr, uint16_t count, uint64_t now_ms, uint16_t* out, uint64_t* age_ms) const;
+};
+
 }  // namespace gs

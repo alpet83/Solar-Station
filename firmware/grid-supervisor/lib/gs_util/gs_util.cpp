@@ -165,6 +165,20 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
     return n;
 }
 
+size_t regs_to_json(uint16_t addr, uint16_t count, uint64_t age_ms, const uint16_t* regs, char* out, size_t cap) {
+    int w = snprintf(out, cap, "{\"addr\":%u,\"count\":%u,\"age_ms\":%llu,\"regs\":[", (unsigned)addr, (unsigned)count, (unsigned long long)age_ms);
+    if (w < 0 || (size_t)w >= cap) { if (cap) out[0] = 0; return 0; }
+    size_t n = (size_t)w;
+    for (uint16_t i = 0; i < count; ++i) {
+        int x = snprintf(out + n, cap - n, "%s%u", i ? "," : "", (unsigned)regs[i]);
+        if (x < 0 || (size_t)x >= cap - n) { out[0] = 0; return 0; }
+        n += (size_t)x;
+    }
+    if (n + 3 > cap) { if (cap) out[0] = 0; return 0; }
+    out[n++] = ']'; out[n++] = '}'; out[n] = 0;
+    return n;
+}
+
 bool parse_ext_current(const char* s, float& out) {
     if (!s || !*s) return false;
     char* end = nullptr;

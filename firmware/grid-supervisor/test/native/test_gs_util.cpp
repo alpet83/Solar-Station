@@ -75,6 +75,9 @@ int main() {
         config_get(d, "pow_min_base_w", b, sizeof b); CHECK(config_set(r, "pow_min_base_w", b) && r.pow_min_base_w == 12345.0f);
     }
     CHECK(flags_to_str(F_HOLD, nullptr, 0) == 0);
+    { uint16_t r[3] = {1, 65535, 0}; char b[100];
+      CHECK(regs_to_json(25201, 3, 1500, r, b, sizeof b) > 0 && !strcmp(b, "{\"addr\":25201,\"count\":3,\"age_ms\":1500,\"regs\":[1,65535,0]}"));
+      CHECK(regs_to_json(25201, 3, 1500, r, b, 50) == 0); }
     float f;
     CHECK(parse_ext_current("12.5", f) && f == 12.5f);
     CHECK(!parse_ext_current("-1", f) && !parse_ext_current("501", f) && !parse_ext_current("x", f) && !parse_ext_current("", f) && !parse_ext_current(nullptr, f));

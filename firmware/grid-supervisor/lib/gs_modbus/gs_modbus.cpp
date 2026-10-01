@@ -111,4 +111,26 @@ Input make_input(const Telemetry& t, uint64_t now_ms, bool safe_mode, float ext_
     return in;
 }
 
+bool RegCache::store(uint16_t addr, uint16_t count, const uint16_t* regs, uint64_t now_ms) {
+    if (count == 0 || count > kMaxBlockRegs) return false;
+    RegBlock* slot = nullptr;
+    for (auto& b : blocks) if (b.valid && b.addr == addr && b.count == count) { slot = &b; break; }
+    if (!slot) for (auto& b : blocks) if (!b.valid) { slot = &b; break; }
+    if (!slot) return false;
+    slot->addr = addr; slot->count = count; slot->at_ms = now_ms; slot->valid = true;
+    for (uint16_t i = 0; i < count; ++i) slot->regs[i] = regs[i];
+    return true;
+}
+
+bool RegCache::lookup(uint16_t addr, uint16_t count, uint64_t now_ms, uint16_t* out, uint64_t* age_ms) const {
+    if (count == 0) return false;
+    for (const auto& b : blocks) {
+        if (!b.valid || addr < b.addr || (uint32_t)addr + count > (uint32_t)b.addr + b.count) continue;
+        for (uint16_t i = 0; i < count; ++i) out[i] = b.regs[addr - b.addr + i];
+        if (age_ms) *age_ms = now_ms >= b.at_ms ? now_ms - b.at_ms : 0;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace gs

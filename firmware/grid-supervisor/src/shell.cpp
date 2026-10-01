@@ -135,7 +135,7 @@ static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 
 static void h_state() {
     if (!authed(false)) return;
     static char buf[2800];
-    Snapshot s;
+    static Snapshot s;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
     s = g_snap; xSemaphoreGive(g_mtx);
     gs::StateView v{&s.tel, &s.dec, &s.in, s.uptime_ms, s.seq, g_boot_id, s.safe_mode, epoch_or_neg(),
@@ -203,6 +203,23 @@ static void h_cmd() {
     if (v != "0" && v != "1") { g_http.send(400, "text/plain", "ongrid must be 0 or 1"); return; }
     g_manual.store(v.toInt());
     g_http.send(200, "text/plain", "queued");
+}
+
+// GET /api/regs?addr=25201&count=79 — сырые регистры из кэша (без обращения к шине). 404, если
+// диапазон не опрашивается; age_ms в ответе — возраст блока, свежесть проверяет потребитель.
+static void h_regs() {
+    if (!authed(false)) return;
+    long addr = g_http.arg("addr").toInt(), cnt = g_http.arg("count").toInt();
+    if (addr < 0 || addr > 65535 || cnt < 1 || cnt > gs::kMaxBlockRegs) { g_http.send(400, "text/plain", "bad range"); return; }
+    static Snapshot s;
+    if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
+    s = g_snap; xSemaphoreGive(g_mtx);
+    static uint16_t regs[gs::kMaxBlockRegs]; uint64_t age = 0;
+    if (!s.cache.lookup((uint16_t)addr, (uint16_t)cnt, now_ms(), regs, &age)) { g_http.send(404, "text/plain", "not cached"); return; }
+    static char buf[700];
+    size_t n = gs::regs_to_json((uint16_t)addr, (uint16_t)cnt, age, regs, buf, sizeof buf);
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(n ? 200 : 500, "application/json", n ? buf : "{}");
 }
 
 static const char kIndex[] PROGMEM =
@@ -351,6 +368,7 @@ void begin(uint32_t boot_id) {
     g_http.collectHeaders(hdr, 3);
     g_http.on("/", HTTP_GET, h_index);
     g_http.on("/api/state", HTTP_GET, h_state);
+    g_http.on("/api/regs", HTTP_GET, h_regs);
     g_http.on("/api/config", HTTP_GET, h_config_get);
     g_http.on("/api/config", HTTP_POST, h_config_set);
     g_http.on("/api/ext", HTTP_POST, h_ext);

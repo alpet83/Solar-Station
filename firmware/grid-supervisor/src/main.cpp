@@ -45,6 +45,7 @@ static const uint32_t kStableBootMs = 600000;    // столько работа�
 
 static gs::Supervisor g_sv;
 static gs::Telemetry g_tel;
+static gs::RegCache g_cache;
 static uint32_t g_stat_ok = 0, g_stat_err = 0, g_stat_foreign = 0, g_stat_busy = 0, g_stat_exc = 0;
 
 // --- safe-mode: счётчик «коротких» загрузок в RTC-памяти -------------------------------------
@@ -132,7 +133,7 @@ static bool read_block(uint16_t addr, uint16_t cnt, uint16_t* regs) {
         if (!wait_idle()) continue;
         tx(q, 8);
         RxRes r = rx_read(0x03, cnt, regs);
-        if (r == RxRes::Ok) { ++g_stat_ok; return true; }
+        if (r == RxRes::Ok) { ++g_stat_ok; g_cache.store(addr, cnt, regs, (uint64_t)(esp_timer_get_time() / 1000)); return true; }
         if (r == RxRes::Exception) { ++g_stat_exc; break; }      // повтор бессмысленен
     }
     ++g_stat_err;
@@ -161,6 +162,18 @@ static void poll_inverter() {
     if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockCfgAddr, gs::kBlockCfgCount, cfg)) gs::decode_cfg(cfg, g_tel);
 }
 
+// Медленные блоки (идентификация, калибровка, параметры заряда): нужны только кэшу /api/regs для
+// pv1800_ctrl.py; читаются при старте и затем раз в 5 минут, при неудаче — повтор через 30 с.
+static void poll_slow() {
+    static uint32_t next = 0;
+    static const struct { uint16_t addr, cnt; } blocks[] = {{20000, 16}, {10001, 8}, {10101, 23}};
+    if ((int32_t)(millis() - next) < 0) return;
+    static uint16_t tmp[gs::kMaxBlockRegs];
+    bool all = true;
+    for (auto& b : blocks) { delay(kBlockSpacingMs); all &= read_block(b.addr, b.cnt, tmp); }
+    next = millis() + (all ? 300000u : 30000u);
+}
+
 // Задача ядра: опрос инвертора, решение, команда, публикация снимка. Работает независимо
 // от оболочки: зависание Wi-Fi/HTTP на неё не влияет (своя задача, свой WDT).
 static void gs_task(void*) {
@@ -180,7 +193,7 @@ static void gs_task(void*) {
         if (shell::take_config(nc)) g_sv.set_config(nc);
         { int mc = shell::take_manual(); if (mc >= 0) g_sv.manual_request(mc ? gs::Cmd::Connect : gs::Cmd::Disconnect, now_ms); }
 
-        if (!shell::ota_active()) poll_inverter(); else g_tel = gs::Telemetry();
+        if (!shell::ota_active()) { poll_inverter(); poll_slow(); } else g_tel = gs::Telemetry();
         float ext_a = gs::kNaN; uint64_t ext_age = 0;
         float a; uint64_t age;
         if (shell::ext_charge(a, age)) { ext_a = a; ext_age = age; }
@@ -200,10 +213,11 @@ static void gs_task(void*) {
                       g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid,
                       (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc);
 
-        shell::Snapshot s;
+        static shell::Snapshot s;
         s.tel = g_tel; s.dec = d; s.in = in; s.uptime_ms = now_ms; s.seq = ++seq; s.safe_mode = g_safe_mode;
         s.paused = (d.flags & gs::F_MANUAL_PAUSE) != 0;
         s.pause_left_ms = s.paused ? g_sv.pause_until_ms() - now_ms : 0;
+        s.cache = g_cache;
         for (size_t i = 0; i < n_events; ++i) s.events[i] = events[i];
         s.n_events = n_events;
         s.rx_ok = g_stat_ok; s.rx_err = g_stat_err; s.rx_foreign = g_stat_foreign; s.rx_busy = g_stat_busy; s.rx_exc = g_stat_exc;
