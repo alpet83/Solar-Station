@@ -257,6 +257,20 @@ static void test_cmd_reason_at_issue() {
     CHECK(e.cmd == Cmd::Connect); CHECK(e.reason == Reason::NoData);
 }
 
+static void test_retry_backoff_and_relay() {
+    Sim s(fast()); s.reg = 0; s.v = s.alt = 47.0f;
+    std::vector<uint64_t> times; uint64_t t0 = s.t;
+    while (s.t - t0 < 400000) {
+        s.t += 5000; Input in; in.now_ms = s.t; in.have_sample = true; in.pack_v = in.pack_v_alt = 47.0f; in.ongrid_reg = 0;
+        if (s.sv.step(in).cmd == Cmd::Connect) times.push_back(s.t);
+    }
+    CHECK(times.size() >= 5 && times.size() <= 9);                       // не каждые 10 с
+    CHECK(times.back() - times[times.size() - 2] >= 75000);              // потолок backoff ~80 с
+    Supervisor sv; Input in; in.now_ms = 1000; in.have_sample = true; in.pack_v = in.pack_v_alt = 52.0f;
+    in.ongrid_reg = 1; in.relay_grid = 0; CHECK(sv.step(in).flags & F_RELAY_MISMATCH);
+    in.now_ms = 6000; in.relay_grid = 1; CHECK(!(sv.step(in).flags & F_RELAY_MISMATCH));
+}
+
 static std::vector<std::vector<double>> load_csv(const char* p) {
     std::vector<std::vector<double>> r; std::ifstream f(p); std::string line; std::getline(f, line);
     while (std::getline(f, line)) {
@@ -296,6 +310,7 @@ int main(int argc, char** argv) {
     test_time_backwards(); test_reboot_loop_safe_mode(); test_own_overlapping_commands();
     test_stale_pending_is_not_confirmation(); test_step_gap(); test_boot_hold(); test_garbage_inputs();
     test_single_source_full(); test_validate_bounds(); test_connect_over_pending_disconnect(); test_cmd_reason_at_issue();
+    test_retry_backoff_and_relay();
     test_incident_replay(argc > 1 ? argv[1] : "test/native/fixtures/incident_2026-10-01.csv");
     printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

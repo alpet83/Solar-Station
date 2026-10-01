@@ -41,6 +41,15 @@ Rx parse_read(const uint8_t* buf, size_t len, uint8_t id, uint8_t fn, uint16_t c
 // Разбор эхо-ответа записи 0x06.
 Rx parse_write_echo(const uint8_t* buf, size_t len, uint8_t id, uint16_t addr, uint16_t value);
 
+// Сканеры по буферу произвольных принятых байт: допускают мусор/эхо перед кадром и склейку
+// нескольких кадров. Возвращают Ok и заполняют regs, если где-то в буфере есть валидный
+// ответ (id, функция, длина, CRC); Exception — если найден ответ-исключение на наш запрос.
+Rx scan_read(const uint8_t* buf, size_t len, uint8_t id, uint8_t fn, uint16_t count, uint16_t* regs);
+
+// true, если в буфере есть валидный 8-байтный ЗАПРОС (fn 03/04/06) к slave id — признак того,
+// что на шине работает другой мастер и ответ инвертора ещё впереди.
+bool scan_has_request(const uint8_t* buf, size_t len, uint8_t id);
+
 // Ожидаемая длина ответа на чтение count регистров.
 constexpr size_t read_response_len(uint16_t count) { return 5u + 2u * count; }
 

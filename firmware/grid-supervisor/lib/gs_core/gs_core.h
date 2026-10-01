@@ -55,6 +55,7 @@ enum Flag : uint32_t {
     F_HOLD            = 1u << 12,  // пауза после подключения ещё не истекла
     F_SINGLE_SRC      = 1u << 13,  // валиден только один из двух регистров напряжения
     F_TIME_JUMP       = 1u << 14,  // обнаружен скачок/откат времени или большой пропуск шагов
+    F_RELAY_MISMATCH  = 1u << 16,  // регистр 20105 и физическое реле расходятся (только алерт)
     F_LOAD_UNKNOWN    = 1u << 15,  // нагрузка в этом шаге неизвестна: «заряжено» не засчитывается
 };
 
@@ -106,6 +107,7 @@ struct Input {
     uint64_t ext_age_ms = 0;       // возраст внешнего значения
     float    load_w = kNaN;     // мощность нагрузки инвертора
     float    grid_v = kNaN;     // напряжение сети
+    int8_t   relay_grid = -1;      // физическое реле сети (25238): -1 неизвестно, 0, 1
     int8_t   ongrid_reg = -1;      // прочитанное значение 20105: -1 неизвестно, 0, 1
     bool     safe_mode = false;    // включён safe-mode (петля перезагрузок)
 
@@ -160,6 +162,7 @@ private:
     int8_t   last_reg_ = -1;
     Cmd      pending_ = Cmd::None;
     uint64_t pending_since_ = 0;
+    uint8_t  retries_ = 0;                    // повторы неподтверждённой команды (для backoff)
     int64_t  last_cmd_conn_ms_ = kInactive;   // когда выдавали Connect / Disconnect
     int64_t  last_cmd_disc_ms_ = kInactive;
     bool     have_last_step_ = false;

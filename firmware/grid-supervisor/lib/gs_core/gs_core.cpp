@@ -132,7 +132,7 @@ Decision Supervisor::step(const Input& in) {
             }
             if (reg == 1) last_connect_ms_ = static_cast<int64_t>(now);  // hold от факта подключения
         }
-        if (pending_ != Cmd::None && reg == (pending_ == Cmd::Connect ? 1 : 0)) pending_ = Cmd::None;
+        if (pending_ != Cmd::None && reg == (pending_ == Cmd::Connect ? 1 : 0)) { pending_ = Cmd::None; retries_ = 0; }
         last_reg_ = reg;
     }
 
@@ -180,6 +180,8 @@ Decision Supervisor::step(const Input& in) {
     if (in.safe_mode) flags |= F_SAFE_MODE;
     if (off_since_ >= 0) flags |= F_OFF_COND;
     if (hold) flags |= F_HOLD;
+    if ((reg == 0 || reg == 1) && (in.relay_grid == 0 || in.relay_grid == 1) && fresh && in.relay_grid != reg)
+        flags |= F_RELAY_MISMATCH;   // реле переключается с задержкой: флаг кратковременный, это нормально
     if (fresh && finite(in.grid_v) && in.grid_v < cfg_.grid_present_v_min && v <= cfg_.soft_on_v)
         flags |= F_GRID_LOST_LOW;
 
@@ -210,16 +212,19 @@ Decision Supervisor::step(const Input& in) {
     // ---- 5. ограничение частоты команд ------------------------------------------------------
     if (issue != Cmd::None) {
         if (pending_ == issue) {
-            if (since(now, pending_since_) < cfg_.cmd_retry_ms) {
+            const uint32_t backoff = cfg_.cmd_retry_ms << (retries_ > 3 ? 3 : retries_);   // 10с,20с,40с,80с(max)
+            if (since(now, pending_since_) < backoff) {
                 issue = Cmd::None;               // уже выдана, ждём подтверждения
                 flags |= F_CMD_PENDING;
             } else {
                 pending_since_ = now;            // повтор неподтверждённой команды
+                if (retries_ < 255) ++retries_;
                 flags |= F_CMD_RETRY;
             }
         } else {
             pending_ = issue;
             pending_since_ = now;
+            retries_ = 0;
         }
     } else if (pending_ != Cmd::None) {
         flags |= F_CMD_PENDING;

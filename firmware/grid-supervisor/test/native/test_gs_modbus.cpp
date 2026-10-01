@@ -74,6 +74,24 @@ int main() {
     // неизвестное значение регистра 20105
     cfg[4] = 7; Telemetry z; decode_cfg(cfg.data(), z); CHECK(z.ongrid_reg == -1);
 
+    // сканеры: мусор перед кадром, склейка запроса и ответа, эхо, исключение
+    {
+        std::vector<uint8_t> junk{0x00, 0xFF}; auto f = resp(4, 0x03, r);
+        junk.insert(junk.end(), f.begin(), f.end());
+        std::vector<uint16_t> o(5);
+        CHECK(scan_read(junk.data(), junk.size(), 4, 0x03, 5, o.data()) == Rx::Ok && o[4] == 504);
+        uint8_t rq[8]; build_read(rq, 8, 4, 0x03, 25201, 5);
+        std::vector<uint8_t> glued(rq, rq + 8); glued.insert(glued.end(), f.begin(), f.end());
+        CHECK(scan_read(glued.data(), glued.size(), 4, 0x03, 5, o.data()) == Rx::Ok);
+        CHECK(scan_has_request(glued.data(), 8, 4));
+        CHECK(!scan_has_request(f.data(), f.size(), 4));
+        CHECK(scan_read(rq, 8, 4, 0x03, 5, o.data()) != Rx::Ok);              // одно эхо запроса — не ответ
+        std::vector<uint8_t> e{0x11, 4, 0x83, 2}; uint16_t cc = crc16(e.data() + 1, 3);
+        e.push_back(cc & 255); e.push_back(cc >> 8);
+        CHECK(scan_read(e.data(), e.size(), 4, 0x03, 5, o.data()) == Rx::Exception);
+        auto part = f; part.resize(part.size() - 3);
+        CHECK(scan_read(part.data(), part.size(), 4, 0x03, 5, o.data()) != Rx::Ok);
+    }
     printf("modbus: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

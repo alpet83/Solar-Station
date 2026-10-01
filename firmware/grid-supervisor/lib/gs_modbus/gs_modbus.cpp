@@ -62,11 +62,28 @@ Rx parse_write_echo(const uint8_t* b, size_t len, uint8_t id, uint16_t addr, uin
     return (a == addr && v == value) ? Rx::Ok : Rx::WrongEcho;
 }
 
+Rx scan_read(const uint8_t* b, size_t len, uint8_t id, uint8_t fn, uint16_t count, uint16_t* regs) {
+    const size_t need = read_response_len(count);
+    for (size_t s = 0; s + 5 <= len; ++s) {
+        if (b[s] != id) continue;
+        if (b[s + 1] == (fn | 0x80) && s + 5 <= len && crc_ok(b + s, 5)) return Rx::Exception;
+        if (b[s + 1] == fn && s + need <= len && parse_read(b + s, need, id, fn, count, regs) == Rx::Ok) return Rx::Ok;
+    }
+    return Rx::Short;
+}
+
+bool scan_has_request(const uint8_t* b, size_t len, uint8_t id) {
+    for (size_t s = 0; s + 8 <= len; ++s) {
+        if (b[s] == id && (b[s + 1] == 0x03 || b[s + 1] == 0x04 || b[s + 1] == 0x06) && crc_ok(b + s, 8)) return true;
+    }
+    return false;
+}
+
 void decode_rt(const uint16_t* r, Telemetry& t) {
     t.pack_v = r[4] * 0.1f;
     t.grid_v = r[6] * 0.1f;
     t.load_w = (float)r[14];
-    t.relay_grid = r[37] ? 1 : 0;
+    t.relay_grid = r[37] ? 1 : 0;   // 25238
     t.rt_ok = true;
 }
 
@@ -88,7 +105,7 @@ Input make_input(const Telemetry& t, uint64_t now_ms, bool safe_mode, float ext_
     in.safe_mode = safe_mode;
     in.ext_charge_a = ext_a;
     in.ext_age_ms = ext_age_ms;
-    if (t.rt_ok) { in.pack_v = t.pack_v; in.grid_v = t.grid_v; in.load_w = t.load_w; }
+    if (t.rt_ok) { in.pack_v = t.pack_v; in.grid_v = t.grid_v; in.load_w = t.load_w; in.relay_grid = t.relay_grid; }
     if (t.chg_ok) { in.pack_v_alt = t.pack_v_alt; in.charge_a = t.chg_curr_a; }
     if (t.cfg_ok) in.ongrid_reg = t.ongrid_reg;
     return in;
