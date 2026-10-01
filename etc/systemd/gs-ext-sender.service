@@ -1,0 +1,11 @@
+[Unit]
+Description=Send Epever charge current to the grid-supervisor board
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/sbin/gs_ext_sender.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
