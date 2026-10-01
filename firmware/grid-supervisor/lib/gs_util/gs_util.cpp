@@ -26,21 +26,33 @@ static const CfgField* find(const char* key) {
     return nullptr;
 }
 
-bool config_set(Config& cfg, const char* key, const char* value) {
+// Разбор значения и запись в cfg БЕЗ проверки всей конфигурации.
+static bool set_raw(Config& cfg, const char* key, const char* value) {
     const CfgField* f = key && value ? find(key) : nullptr;
     if (!f || !*value) return false;
-    Config cand = cfg;
     char* end = nullptr;
     if (f->kind == CfgField::F32) {
         float v = strtof(value, &end);
         if (*end || !std::isfinite(v)) return false;
-        *reinterpret_cast<float*>(reinterpret_cast<char*>(&cand) + f->off) = v;
+        memcpy(reinterpret_cast<char*>(&cfg) + f->off, &v, 4);
     } else {
         if (*value == '-') return false;
         unsigned long v = strtoul(value, &end, 10);
         if (*end || v > 0xFFFFFFFFul) return false;
-        *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&cand) + f->off) = (uint32_t)v;
+        uint32_t u = (uint32_t)v;
+        memcpy(reinterpret_cast<char*>(&cfg) + f->off, &u, 4);
     }
+    return true;
+}
+
+bool config_set(Config& cfg, const char* key, const char* value) {
+    return config_apply_pairs(cfg, &key, &value, 1);
+}
+
+bool config_apply_pairs(Config& cfg, const char* const* keys, const char* const* vals, size_t n) {
+    Config cand = cfg;
+    for (size_t i = 0; i < n; ++i)
+        if (!set_raw(cand, keys[i], vals[i])) return false;
     if (!cand.validate()) return false;
     cfg = cand;
     return true;
@@ -50,7 +62,7 @@ bool config_get(const Config& cfg, const char* key, char* out, size_t cap) {
     const CfgField* f = find(key);
     if (!f) return false;
     const char* p = reinterpret_cast<const char*>(&cfg) + f->off;
-    if (f->kind == CfgField::F32) { float v; memcpy(&v, p, 4); snprintf(out, cap, "%.4g", v); }
+    if (f->kind == CfgField::F32) { float v; memcpy(&v, p, 4); snprintf(out, cap, "%.9g", v); }
     else { uint32_t v; memcpy(&v, p, 4); snprintf(out, cap, "%lu", (unsigned long)v); }
     return true;
 }
@@ -80,11 +92,12 @@ size_t flags_to_str(uint32_t fl, char* out, size_t cap) {
         {F_TIME_JUMP, "TIME_JUMP"}, {F_LOAD_UNKNOWN, "LOAD_UNKNOWN"}, {F_RELAY_MISMATCH, "RELAY_MISMATCH"},
     };
     size_t n = 0;
-    if (cap) out[0] = 0;
+    if (!cap) return 0;
+    out[0] = 0;
     for (auto& e : names) {
         if (!(fl & e.bit)) continue;
         int w = snprintf(out + n, cap > n ? cap - n : 0, "%s%s", n ? "," : "", e.name);
-        if (w < 0 || (size_t)w >= cap - n) { out[cap ? cap - 1 : 0] = 0; return n; }
+        if (w < 0 || (size_t)w >= cap - n) { out[n] = 0; return n; }
         n += (size_t)w;
     }
     return n;
@@ -95,9 +108,10 @@ static void num(char* out, size_t cap, float v) {
 }
 
 size_t state_to_json(const StateView& s, char* out, size_t cap) {
-    char vp[16], va[16], ch[16], ld[16], gv[16], fl[200], ts[32] = "";
+    char vp[16], va[16], ch[16], ld[16], gv[16], vu[16], ef[16], pm[16], fl[200], ts[32] = "";
     num(vp, sizeof vp, s.tel->pack_v); num(va, sizeof va, s.tel->pack_v_alt);
     num(ch, sizeof ch, s.tel->chg_curr_a); num(ld, sizeof ld, s.tel->load_w); num(gv, sizeof gv, s.tel->grid_v);
+    num(vu, sizeof vu, s.dec->v_used); num(ef, sizeof ef, s.dec->eff_charge_a); num(pm, sizeof pm, s.dec->pow_min_w);
     flags_to_str(s.dec->flags, fl, sizeof fl);
     if (s.epoch_s >= 0) {
         time_t t = (time_t)s.epoch_s; struct tm tmv;
@@ -109,7 +123,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         "\"t\":%lld,\"ts\":%s%s%s,"
         "\"voltages\":{\"battery\":%s,\"alt\":%s,\"grid\":%s},\"charge_a\":%s,\"load_w\":%s,"
         "\"ongrid_reg\":%d,\"relay_grid\":%d,\"rt_ok\":%s,\"chg_ok\":%s,\"cfg_ok\":%s,"
-        "\"decision\":{\"v_used\":%.2f,\"eff_charge_a\":%.2f,\"pow_min_w\":%.0f,\"flags\":\"%s\",\"flags_raw\":%lu},"
+        "\"decision\":{\"v_used\":%s,\"eff_charge_a\":%s,\"pow_min_w\":%s,\"flags\":\"%s\",\"flags_raw\":%lu},"
         "\"safe_mode\":%s,\"paused\":%s,\"pause_left_s\":%llu,"
         "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu}}",
         (unsigned long)s.seq, (unsigned long)s.boot_id, (unsigned long long)s.uptime_ms,
@@ -117,7 +131,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         s.epoch_s >= 0 ? "\"" : "", s.epoch_s >= 0 ? ts : "null", s.epoch_s >= 0 ? "\"" : "",
         vp, va, gv, ch, ld, (int)s.tel->ongrid_reg, (int)s.tel->relay_grid,
         s.tel->rt_ok ? "true" : "false", s.tel->chg_ok ? "true" : "false", s.tel->cfg_ok ? "true" : "false",
-        s.dec->v_used, s.dec->eff_charge_a, s.dec->pow_min_w, fl, (unsigned long)s.dec->flags,
+        vu, ef, pm, fl, (unsigned long)s.dec->flags,
         s.safe_mode ? "true" : "false", s.paused ? "true" : "false", (unsigned long long)(s.pause_left_ms / 1000),
         (unsigned long)s.rx_ok, (unsigned long)s.rx_err, (unsigned long)s.rx_foreign, (unsigned long)s.rx_busy,
         (unsigned long)s.rx_exc);

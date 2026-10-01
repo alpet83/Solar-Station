@@ -47,6 +47,25 @@ int main() {
     CHECK(state_to_json(sv, tiny, sizeof tiny) == 0);
     printf("%s\n", out);
 
+    // атомарный набор: сдвиг всех порогов, недостижимый пошагово от значений по умолчанию
+    {
+        Config d; const char* k[] = {"hard_floor_v", "soft_on_v", "soft_off_v", "full_v"};
+        const char* vv[] = {"52", "52.6", "53.4", "54.6"};
+        CHECK(!config_set(d, "hard_floor_v", "52"));                     // пошагово нельзя
+        CHECK(config_apply_pairs(d, k, vv, 4) && d.hard_floor_v == 52.0f && d.full_v == 54.6f);
+        const char* bad[] = {"52", "52.6", "53.4", "80"};
+        Config e; CHECK(!config_apply_pairs(e, k, bad, 4) && e.hard_floor_v == 48.0f);   // откат целиком
+        const char* mixed[] = {"52", "x", "53.4", "54.6"};
+        CHECK(!config_apply_pairs(e, k, mixed, 4));
+    }
+    // точный round-trip нетривиальных значений
+    {
+        Config d; CHECK(config_set(d, "pow_min_base_w", "12345") && config_set(d, "load_factor", "0.97"));
+        char b[32]; config_get(d, "pow_min_base_w", b, sizeof b); CHECK(!strcmp(b, "12345"));
+        Config r; config_get(d, "load_factor", b, sizeof b); CHECK(config_set(r, "load_factor", b) && r.load_factor == d.load_factor);
+        config_get(d, "pow_min_base_w", b, sizeof b); CHECK(config_set(r, "pow_min_base_w", b) && r.pow_min_base_w == 12345.0f);
+    }
+    CHECK(flags_to_str(F_HOLD, nullptr, 0) == 0);
     float f;
     CHECK(parse_ext_current("12.5", f) && f == 12.5f);
     CHECK(!parse_ext_current("-1", f) && !parse_ext_current("501", f) && !parse_ext_current("x", f) && !parse_ext_current("", f) && !parse_ext_current(nullptr, f));

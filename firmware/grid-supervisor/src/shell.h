@@ -23,6 +23,9 @@ void loop();                                   // вызывать из loop(): 
 void publish(const Snapshot& s);               // задача ядра публикует снимок
 bool take_config(gs::Config& out);             // true, если конфигурация изменилась (однократно)
 gs::Config load_config();                      // из NVS, при невалидности — значения по умолчанию
-bool ext_charge(float& a, uint64_t& age_ms);   // последнее внешнее значение тока от Pi
+bool ext_charge(float& a, uint64_t& age_ms);   // последнее внешнее значение тока от Pi (без блокировок)
+bool ota_active();                             // идёт загрузка образа: ядру не передавать на шину
+uint64_t heartbeat_age_ms();                   // сколько оболочка не вызывала loop()
+void mark_healthy(uint32_t publishes);         // ядро сообщает число успешных циклов (критерий валидности OTA-образа)
 
 }  // namespace shell

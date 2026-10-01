@@ -19,6 +19,11 @@ extern const size_t kCfgFieldCount;
 // после изменения проходит validate(); иначе cfg не меняется и возвращается false.
 bool config_set(Config& cfg, const char* key, const char* value);
 
+// Атомарное применение набора пар ключ/значение: все поля разбираются в кандидата и
+// проверяются ОДНИМ вызовом validate(). При любой ошибке cfg не меняется. Это нужно и для
+// загрузки из NVS (набор, недостижимый пошагово), и для сдвига нескольких порогов сразу.
+bool config_apply_pairs(Config& cfg, const char* const* keys, const char* const* vals, size_t n);
+
 // Читает значение поля в строку (для NVS/JSON). false — неизвестный ключ.
 bool config_get(const Config& cfg, const char* key, char* out, size_t cap);
 

@@ -177,7 +177,7 @@ static void gs_task(void*) {
         gs::Config nc;
         if (shell::take_config(nc)) g_sv.set_config(nc);
 
-        poll_inverter();
+        if (!shell::ota_active()) poll_inverter(); else g_tel = gs::Telemetry();
         float ext_a = gs::kNaN; uint64_t ext_age = 0;
         float a; uint64_t age;
         if (shell::ext_charge(a, age)) { ext_a = a; ext_age = age; }
@@ -185,7 +185,8 @@ static void gs_task(void*) {
         gs::Decision d = g_sv.step(in);
 
         if (d.cmd != gs::Cmd::None) {
-            bool ok = write_ongrid(d.cmd == gs::Cmd::Connect);
+            // во время OTA (стирание flash блокирует кэш и UART ISR) на шину не передаём: ядро повторит команду
+            bool ok = !shell::ota_active() && write_ongrid(d.cmd == gs::Cmd::Connect);
             Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
         }
         Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u\n",
@@ -198,6 +199,9 @@ static void gs_task(void*) {
         s.pause_left_ms = s.paused ? g_sv.pause_until_ms() - now_ms : 0;
         s.rx_ok = g_stat_ok; s.rx_err = g_stat_err; s.rx_foreign = g_stat_foreign; s.rx_busy = g_stat_busy; s.rx_exc = g_stat_exc;
         shell::publish(s);
+        shell::mark_healthy(seq);
+        // оболочка зависла надолго — перезапуск (SW-сброс не считается аварийным; ядро безопасно стартует в сторону сети)
+        if (shell::heartbeat_age_ms() > 900000) { Serial.println("shell stalled -> restart"); delay(100); ESP.restart(); }
     }
 }
 
@@ -211,7 +215,7 @@ void setup() {
 
     esp_task_wdt_config_t wdt = {.timeout_ms = kWdtSeconds * 1000, .idle_core_mask = 0, .trigger_panic = true};
     if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
-    esp_task_wdt_add(nullptr);          // и для loop() с оболочкой
+    // loop() (оболочка) намеренно НЕ в TWDT: её зависание не должно перезагружать ядро.
 
     g_sv.set_config(shell::load_config());
     shell::begin(esp_random());
@@ -220,7 +224,6 @@ void setup() {
 }
 
 void loop() {
-    esp_task_wdt_reset();
     shell::loop();
     delay(2);
 }
