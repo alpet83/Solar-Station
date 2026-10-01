@@ -10,6 +10,7 @@
 
 #include "gs_core.h"
 #include "gs_modbus.h"
+#include "shell.h"
 
 #ifndef GS_RS485_RX
 #define GS_RS485_RX 21
@@ -159,6 +160,47 @@ static void poll_inverter() {
     if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockCfgAddr, gs::kBlockCfgCount, cfg)) gs::decode_cfg(cfg, g_tel);
 }
 
+// Задача ядра: опрос инвертора, решение, команда, публикация снимка. Работает независимо
+// от оболочки: зависание Wi-Fi/HTTP на неё не влияет (своя задача, свой WDT).
+static void gs_task(void*) {
+    esp_task_wdt_add(nullptr);
+    uint32_t next = millis();
+    uint32_t seq = 0;
+    for (;;) {
+        esp_task_wdt_reset();
+        if ((int32_t)(millis() - next) < 0) { delay(5); continue; }
+        next = millis() + kPollPeriodMs;
+
+        const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+        if (now_ms > kStableBootMs) { rtc_short_boots = 0; g_safe_mode = false; }   // стабильно проработали — выходим из safe-mode
+
+        gs::Config nc;
+        if (shell::take_config(nc)) g_sv.set_config(nc);
+
+        poll_inverter();
+        float ext_a = gs::kNaN; uint64_t ext_age = 0;
+        float a; uint64_t age;
+        if (shell::ext_charge(a, age)) { ext_a = a; ext_age = age; }
+        gs::Input in = gs::make_input(g_tel, now_ms, g_safe_mode, ext_a, ext_age);
+        gs::Decision d = g_sv.step(in);
+
+        if (d.cmd != gs::Cmd::None) {
+            bool ok = write_ongrid(d.cmd == gs::Cmd::Connect);
+            Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
+        }
+        Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u\n",
+                      g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid,
+                      (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc);
+
+        shell::Snapshot s;
+        s.tel = g_tel; s.dec = d; s.in = in; s.uptime_ms = now_ms; s.seq = ++seq; s.safe_mode = g_safe_mode;
+        s.paused = (d.flags & gs::F_MANUAL_PAUSE) != 0;
+        s.pause_left_ms = s.paused ? g_sv.pause_until_ms() - now_ms : 0;
+        s.rx_ok = g_stat_ok; s.rx_err = g_stat_err; s.rx_foreign = g_stat_foreign; s.rx_busy = g_stat_busy; s.rx_exc = g_stat_exc;
+        shell::publish(s);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     init_boot_counter();
@@ -169,28 +211,16 @@ void setup() {
 
     esp_task_wdt_config_t wdt = {.timeout_ms = kWdtSeconds * 1000, .idle_core_mask = 0, .trigger_panic = true};
     if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
-    if (esp_task_wdt_add(nullptr) != ESP_OK) Serial.println("WDT: add failed");
+    esp_task_wdt_add(nullptr);          // и для loop() с оболочкой
+
+    g_sv.set_config(shell::load_config());
+    shell::begin(esp_random());
     Serial.printf("gs boot: reset=%d short_boots=%u safe=%d\n", (int)esp_reset_reason(), (unsigned)rtc_short_boots, g_safe_mode);
+    xTaskCreatePinnedToCore(gs_task, "gs_core", 8192, nullptr, 3, nullptr, 1);
 }
 
 void loop() {
-    static uint32_t next = 0;
     esp_task_wdt_reset();
-    if ((int32_t)(millis() - next) < 0) { delay(5); return; }
-    next = millis() + kPollPeriodMs;
-
-    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
-    if (now_ms > kStableBootMs) { rtc_short_boots = 0; g_safe_mode = false; }   // стабильно проработали — выходим из safe-mode
-
-    poll_inverter();
-    gs::Input in = gs::make_input(g_tel, now_ms, g_safe_mode, gs::kNaN, 0);
-    gs::Decision d = g_sv.step(in);
-
-    if (d.cmd != gs::Cmd::None) {
-        bool ok = write_ongrid(d.cmd == gs::Cmd::Connect);
-        Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
-    }
-    Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u\n",
-                  g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid,
-                  (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc);
+    shell::loop();
+    delay(2);
 }

@@ -137,6 +137,9 @@ public:
 
     const Config& config() const { return cfg_; }
 
+    // Горячая смена конфигурации (из веб-интерфейса). Невалидная конфигурация игнорируется.
+    bool set_config(const Config& c) { if (!c.validate()) return false; cfg_ = c; return true; }
+
     // Для дашборда/отладки.
     uint64_t pause_until_ms() const { return pause_until_ms_; }
 
