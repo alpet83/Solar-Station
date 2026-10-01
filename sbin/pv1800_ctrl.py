@@ -29,6 +29,14 @@ BAUDRATE = 19200
 CMD_FILE = '/root/inverter_cmd.lst'
 ADDR = 20000
 PV1800_ID = 20566
+# Supervisor mode: the RS485 bus belongs to the grid-supervisor board (see firmware/grid-supervisor).
+# Registers are read from its cache over HTTP, and the only write is 20105 (via /api/cmd).
+# Config file (NOT in the repository): line 1 = base URL, line 2 = user:password.
+SUPERVISOR_CONF = '/etc/gs-supervisor.conf'
+SUP_FAST_BLOCKS = (15201, 25201, 20101)   # must be fresh; other blocks are slow-polled static data
+SUP_FAST_MAX_AGE_MS = 60000
+SUP_SLOW_MAX_AGE_MS = 900000
+sup = None
 
 prev_state = {'w': 0, 'inv_curr': 0, 'grid_curr': 0, 'load_curr': 0}
 
@@ -36,8 +44,49 @@ def s16(i):
     return i | (-(i & 0x8000))
 
 
+def load_supervisor():
+    global sup
+    try:
+        with open(SUPERVISOR_CONF) as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+        user, _, pwd = lines[1].partition(':')
+        sup = {'url': lines[0].rstrip('/'), 'user': user, 'pass': pwd}
+    except FileNotFoundError:
+        sup = None
+    return sup
+
+
+def sup_request(path, data=None):
+    import base64
+    import urllib.request
+    req = urllib.request.Request(sup['url'] + path, data=data)
+    tok = base64.b64encode(f"{sup['user']}:{sup['pass']}".encode()).decode()
+    req.add_header('Authorization', 'Basic ' + tok)
+    req.add_header('X-GS', '1')
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.read().decode()
+
+
+def sup_read_regs(addr, count):
+    for attempt in range(3):
+        try:
+            j = json.loads(sup_request(f'/api/regs?addr={addr}&count={count}'))
+            fast = any(b <= addr < b + 100 for b in SUP_FAST_BLOCKS)
+            limit = SUP_FAST_MAX_AGE_MS if fast else SUP_SLOW_MAX_AGE_MS
+            if j['age_ms'] > limit:
+                raise RuntimeError(f"stale {count}@{addr}: {j['age_ms']} ms")
+            if len(j['regs']) == count:
+                return j['regs']
+        except Exception as e:
+            log.warning(f" ({attempt}) supervisor read failed {count}@{addr}: {e}")
+            time.sleep(1)
+    raise AssertionError(f"#FATAL: can't read registers {count}@{addr} from supervisor")
+
+
 def read_regs(addr, count):
     rr = None
+    if sup:
+        return sup_read_regs(addr, count)
     time.sleep(0.3)  # tx separation delay
     if client:
         for attempt in range(5):
@@ -190,7 +239,21 @@ def process_cmd(cmd):
             now = datetime.now()
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
             # note: contrary to protocol documentation 10001-10008 is read-only registers
-            if ((addr >= 10101) and (addr <= 10124)) or ((addr >= 20002) and (addr <= 20144)):
+            if sup and addr != 20105:
+                print(f"#ERROR: write to {addr} is not supported in supervisor mode")
+                with open(CMD_FILE + '.log', "a") as cmdl:
+                    cmdl.write(f"[{ts}] {cmd} ignored (supervisor mode allows only 20105)\n")
+            elif sup:
+                result = 'FAIL'
+                if val in (0, 1):
+                    try:
+                        sup_request('/api/cmd', ('ongrid=%d' % val).encode())
+                        result = 'QUEUED'   # the board applies it with its own checks; may be overridden by protections
+                    except Exception as e:
+                        log.warning(f"supervisor cmd failed: {e}")
+                with open(CMD_FILE + '.log', "a") as cmdl:
+                    cmdl.write(f"[{ts}] {cmd} = {result}\n")
+            elif ((addr >= 10101) and (addr <= 10124)) or ((addr >= 20002) and (addr <= 20144)):
                 print(f"#CMD: trying set [{addr}] = {val}")
                 result = 'FAIL'
                 for attempt in range(10):
@@ -330,6 +393,11 @@ def using_mini():
 if __name__ == "__main__":
     time.sleep(1)  # datalogger conflict prevention with crontab usage
     #
-    if not using_pymodbus():
+    if load_supervisor():
+        print("#DBG: supervisor mode, registers from " + sup['url'])
+        regs = read_regs(ADDR, 1)
+        if regs and regs[0] == PV1800_ID:
+            read_loop()
+    elif not using_pymodbus():
         using_mini()
 
