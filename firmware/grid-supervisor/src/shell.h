@@ -15,6 +15,7 @@ struct Snapshot {
     uint64_t uptime_ms = 0; uint32_t seq = 0; bool safe_mode = false;
     bool paused = false; uint64_t pause_left_ms = 0;
     uint32_t rx_ok = 0, rx_err = 0, rx_foreign = 0, rx_busy = 0, rx_exc = 0;
+    gs::Event events[gs::kEventCap]; size_t n_events = 0;     // от новых к старым
 };
 
 void begin(uint32_t boot_id);
@@ -24,6 +25,7 @@ void publish(const Snapshot& s);               // задача ядра публ
 bool take_config(gs::Config& out);             // true, если конфигурация изменилась (однократно)
 gs::Config load_config();                      // из NVS, при невалидности — значения по умолчанию
 bool ext_charge(float& a, uint64_t& age_ms);   // последнее внешнее значение тока от Pi (без блокировок)
+int take_manual();                             // -1 нет, 0 = OFF-grid, 1 = ON-grid (команда оператора, однократно)
 bool ota_active();                             // идёт загрузка образа: ядру не передавать на шину
 uint64_t heartbeat_age_ms();                   // сколько оболочка не вызывала loop()
 void mark_healthy(uint32_t publishes);         // ядро сообщает число успешных циклов (критерий валидности OTA-образа)

@@ -36,6 +36,7 @@ enum class Reason : uint8_t {
     NoData,      // нет валидных измерений дольше no_data_timeout
     Charged,     // батарея заряжена и заряд достаточен для нагрузки
     SafeMode,    // safe-mode (петля перезагрузок): сеть подключаем немедленно
+    Manual,      // команда оператора (HA/веб); включает ручную паузу автоматики
 };
 
 // Битовые флаги состояния (для дашборда/алертов). Не все приводят к команде.
@@ -140,6 +141,13 @@ public:
     // Горячая смена конфигурации (из веб-интерфейса). Невалидная конфигурация игнорируется.
     bool set_config(const Config& c) { if (!c.validate()) return false; cfg_ = c; return true; }
 
+    // Команда оператора. Включает ручную паузу автоматики и выполняется при следующем step(),
+    // но НЕ отменяет защиты: hard-floor/NoData/safe-mode при необходимости вернут сеть.
+    void manual_request(Cmd c, uint64_t now_ms) {
+        if (c == Cmd::None) return;
+        manual_req_ = c; pause_until_ms_ = now_ms + cfg_.manual_pause_ms;
+    }
+
     // Для дашборда/отладки.
     uint64_t pause_until_ms() const { return pause_until_ms_; }
 
@@ -165,6 +173,7 @@ private:
     int8_t   last_reg_ = -1;
     Cmd      pending_ = Cmd::None;
     uint64_t pending_since_ = 0;
+    Cmd      manual_req_ = Cmd::None;
     uint8_t  retries_ = 0;                    // повторы неподтверждённой команды (для backoff)
     int64_t  last_cmd_conn_ms_ = kInactive;   // когда выдавали Connect / Disconnect
     int64_t  last_cmd_disc_ms_ = kInactive;

@@ -22,6 +22,7 @@ static bool g_cfg_dirty = false;
 static std::atomic<uint32_t> g_ext_bits{0};        // float как биты — без мьютекса
 static std::atomic<int64_t> g_ext_at_ms{-1};
 static std::atomic<bool> g_ota_active{false};
+static std::atomic<int> g_manual{-1};
 static std::atomic<uint64_t> g_hb_ms{0};
 static std::atomic<uint32_t> g_publishes{0};
 static String g_xtok;                 // токен только для /api/ext (отдельная роль для Pi)
@@ -84,6 +85,7 @@ bool ext_charge(float& a, uint64_t& age_ms) {
     return true;
 }
 
+int take_manual() { return g_manual.exchange(-1); }
 bool ota_active() { return g_ota_active.load(); }
 uint64_t heartbeat_age_ms() { uint64_t h = g_hb_ms.load(); return h ? now_ms() - h : 0; }
 void mark_healthy(uint32_t n) { g_publishes.store(n); }
@@ -132,12 +134,12 @@ static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 
 
 static void h_state() {
     if (!authed(false)) return;
-    static char buf[1400];
+    static char buf[2800];
     Snapshot s;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
     s = g_snap; xSemaphoreGive(g_mtx);
     gs::StateView v{&s.tel, &s.dec, &s.in, s.uptime_ms, s.seq, g_boot_id, s.safe_mode, epoch_or_neg(),
-                    s.paused, s.pause_left_ms, s.rx_ok, s.rx_err, s.rx_foreign, s.rx_busy, s.rx_exc};
+                    s.paused, s.pause_left_ms, s.rx_ok, s.rx_err, s.rx_foreign, s.rx_busy, s.rx_exc, s.events, s.n_events};
     size_t n = gs::state_to_json(v, buf, sizeof buf);
     g_http.sendHeader("Cache-Control", "no-store");
     g_http.send(n ? 200 : 500, "application/json", n ? buf : "{}");
@@ -191,6 +193,16 @@ static void h_ext() {
     uint32_t bits; memcpy(&bits, &a, 4);
     g_ext_bits.store(bits); g_ext_at_ms.store((int64_t)now_ms());
     g_http.send(200, "text/plain", "ok");
+}
+
+// POST /api/cmd  ongrid=0|1 — команда оператора (из HA через мост на Pi). Включает ручную паузу
+// автоматики; защиты (hard-floor и др.) команду при необходимости перебивают.
+static void h_cmd() {
+    if (!authed(true)) return;
+    String v = g_http.arg("ongrid");
+    if (v != "0" && v != "1") { g_http.send(400, "text/plain", "ongrid must be 0 or 1"); return; }
+    g_manual.store(v.toInt());
+    g_http.send(200, "text/plain", "queued");
 }
 
 static const char kIndex[] PROGMEM =
@@ -342,6 +354,7 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/config", HTTP_GET, h_config_get);
     g_http.on("/api/config", HTTP_POST, h_config_set);
     g_http.on("/api/ext", HTTP_POST, h_ext);
+    g_http.on("/api/cmd", HTTP_POST, h_cmd);
     g_http.on("/setup", HTTP_ANY, h_setup);
     g_http.on("/update", HTTP_GET, h_update_form);
     g_http.on("/update", HTTP_POST, h_update_done, h_update_upload);

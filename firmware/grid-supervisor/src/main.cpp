@@ -11,6 +11,7 @@
 #include "gs_core.h"
 #include "gs_modbus.h"
 #include "shell.h"
+#include <ctime>
 
 #ifndef GS_RS485_RX
 #define GS_RS485_RX 21
@@ -165,7 +166,8 @@ static void poll_inverter() {
 static void gs_task(void*) {
     esp_task_wdt_add(nullptr);
     uint32_t next = millis();
-    uint32_t seq = 0;
+    uint32_t seq = 0, ev_id = 0;
+    gs::Event events[gs::kEventCap]; size_t n_events = 0;
     for (;;) {
         esp_task_wdt_reset();
         if ((int32_t)(millis() - next) < 0) { delay(5); continue; }
@@ -176,6 +178,7 @@ static void gs_task(void*) {
 
         gs::Config nc;
         if (shell::take_config(nc)) g_sv.set_config(nc);
+        { int mc = shell::take_manual(); if (mc >= 0) g_sv.manual_request(mc ? gs::Cmd::Connect : gs::Cmd::Disconnect, now_ms); }
 
         if (!shell::ota_active()) poll_inverter(); else g_tel = gs::Telemetry();
         float ext_a = gs::kNaN; uint64_t ext_age = 0;
@@ -187,6 +190,10 @@ static void gs_task(void*) {
         if (d.cmd != gs::Cmd::None) {
             // во время OTA (стирание flash блокирует кэш и UART ISR) на шину не передаём: ядро повторит команду
             bool ok = !shell::ota_active() && write_ongrid(d.cmd == gs::Cmd::Connect);
+            gs::Event e; e.id = ++ev_id; e.cmd = d.cmd; e.reason = d.reason; e.uptime_ms = now_ms; e.v = d.v_used; e.ok = ok;
+            time_t tt = time(nullptr); e.epoch_s = tt > 1700000000 ? (int64_t)tt : -1;
+            for (size_t i = gs::kEventCap - 1; i > 0; --i) events[i] = events[i - 1];
+            events[0] = e; if (n_events < gs::kEventCap) ++n_events;
             Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
         }
         Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u\n",
@@ -197,6 +204,8 @@ static void gs_task(void*) {
         s.tel = g_tel; s.dec = d; s.in = in; s.uptime_ms = now_ms; s.seq = ++seq; s.safe_mode = g_safe_mode;
         s.paused = (d.flags & gs::F_MANUAL_PAUSE) != 0;
         s.pause_left_ms = s.paused ? g_sv.pause_until_ms() - now_ms : 0;
+        for (size_t i = 0; i < n_events; ++i) s.events[i] = events[i];
+        s.n_events = n_events;
         s.rx_ok = g_stat_ok; s.rx_err = g_stat_err; s.rx_foreign = g_stat_foreign; s.rx_busy = g_stat_busy; s.rx_exc = g_stat_exc;
         shell::publish(s);
         shell::mark_healthy(seq);

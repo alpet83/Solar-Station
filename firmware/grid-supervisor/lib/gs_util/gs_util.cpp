@@ -107,6 +107,14 @@ static void num(char* out, size_t cap, float v) {
     if (std::isfinite(v)) snprintf(out, cap, "%.2f", v); else snprintf(out, cap, "null");
 }
 
+const char* reason_name(Reason r) {
+    switch (r) {
+        case Reason::HardFloor: return "HARD_FLOOR"; case Reason::SoftLow: return "SOFT_LOW"; case Reason::NoData: return "NO_DATA";
+        case Reason::Charged: return "CHARGED"; case Reason::SafeMode: return "SAFE_MODE"; case Reason::Manual: return "MANUAL";
+        default: return "NONE";
+    }
+}
+
 size_t state_to_json(const StateView& s, char* out, size_t cap) {
     char vp[16], va[16], ch[16], ld[16], gv[16], vu[16], ef[16], pm[16], fl[200], ts[32] = "";
     num(vp, sizeof vp, s.tel->pack_v); num(va, sizeof va, s.tel->pack_v_alt);
@@ -125,7 +133,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         "\"ongrid_reg\":%d,\"relay_grid\":%d,\"rt_ok\":%s,\"chg_ok\":%s,\"cfg_ok\":%s,"
         "\"decision\":{\"v_used\":%s,\"eff_charge_a\":%s,\"pow_min_w\":%s,\"flags\":\"%s\",\"flags_raw\":%lu},"
         "\"safe_mode\":%s,\"paused\":%s,\"pause_left_s\":%llu,"
-        "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu}}",
+        "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu},\"events\":[",
         (unsigned long)s.seq, (unsigned long)s.boot_id, (unsigned long long)s.uptime_ms,
         s.epoch_s >= 0 ? "true" : "false", (long long)s.epoch_s,
         s.epoch_s >= 0 ? "\"" : "", s.epoch_s >= 0 ? ts : "null", s.epoch_s >= 0 ? "\"" : "",
@@ -136,7 +144,25 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         (unsigned long)s.rx_ok, (unsigned long)s.rx_err, (unsigned long)s.rx_foreign, (unsigned long)s.rx_busy,
         (unsigned long)s.rx_exc);
     if (w < 0 || (size_t)w >= cap) { if (cap) out[0] = 0; return 0; }
-    return (size_t)w;
+    size_t n = (size_t)w;
+    for (size_t i = 0; i < s.n_events && s.events; ++i) {
+        const Event& e = s.events[i];
+        if (e.cmd == Cmd::None) continue;
+        char ets[24] = "null";
+        if (e.epoch_s >= 0) {
+            time_t t = (time_t)e.epoch_s; struct tm tmv; gmtime_r(&t, &tmv);
+            snprintf(ets, sizeof ets, "\"%04d-%02d-%02d %02d:%02d:%02d\"", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        }
+        char vv[16]; num(vv, sizeof vv, e.v);
+        int x = snprintf(out + n, cap - n, "%s{\"id\":%lu,\"cmd\":\"%s\",\"reason\":\"%s\",\"ts\":%s,\"uptime_ms\":%llu,\"v\":%s,\"ok\":%s}",
+                         i ? "," : "", (unsigned long)e.id, e.cmd == Cmd::Connect ? "CONNECT" : "DISCONNECT", reason_name(e.reason),
+                         ets, (unsigned long long)e.uptime_ms, vv, e.ok ? "true" : "false");
+        if (x < 0 || (size_t)x >= cap - n) { if (cap) out[0] = 0; return 0; }
+        n += (size_t)x;
+    }
+    if (n + 3 > cap) { if (cap) out[0] = 0; return 0; }
+    out[n++] = ']'; out[n++] = '}'; out[n] = 0;
+    return n;
 }
 
 bool parse_ext_current(const char* s, float& out) {

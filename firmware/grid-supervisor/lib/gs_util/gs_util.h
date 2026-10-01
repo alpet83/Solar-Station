@@ -32,12 +32,18 @@ size_t config_to_json(const Config& cfg, char* out, size_t cap);
 // Имена флагов решения через запятую, например "SOFT_LOW,HOLD".
 size_t flags_to_str(uint32_t flags, char* out, size_t cap);
 
+// Событие переключения (журнал в RAM, последние kEventCap). id растёт в пределах boot_id.
+constexpr size_t kEventCap = 8;
+struct Event { uint32_t id = 0; Cmd cmd = Cmd::None; Reason reason = Reason::None; int64_t epoch_s = -1; uint64_t uptime_ms = 0; float v = 0; bool ok = false; };
+const char* reason_name(Reason r);
+
 struct StateView {
     const Telemetry* tel; const Decision* dec; const Input* in;
     uint64_t uptime_ms; uint32_t seq; uint32_t boot_id; bool safe_mode;
     int64_t epoch_s;                 // -1 если время не синхронизировано
     bool paused; uint64_t pause_left_ms;
     uint32_t rx_ok, rx_err, rx_foreign, rx_busy, rx_exc;
+    const Event* events = nullptr; size_t n_events = 0;     // от новых к старым
 };
 // JSON состояния. Время — UTC: epoch в "t" и ISO в "ts" (только если epoch_s >= 0).
 size_t state_to_json(const StateView& s, char* out, size_t cap);

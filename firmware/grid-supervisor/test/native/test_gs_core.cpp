@@ -271,6 +271,21 @@ static void test_retry_backoff_and_relay() {
     in.now_ms = 6000; in.relay_grid = 1; CHECK(!(sv.step(in).flags & F_RELAY_MISMATCH));
 }
 
+static void test_manual_request() {
+    // ручное отключение при полной батарее: выполняется сразу, пауза блокирует автоматику
+    Sim s(fast()); s.reg = 1; s.v = s.alt = 52.0f; s.tick();
+    s.sv.manual_request(Cmd::Disconnect, s.t);
+    Decision d = s.tick(); CHECK(d.cmd == Cmd::Disconnect && d.reason == Reason::Manual);
+    CHECK(s.reg == 0); s.tick(); CHECK(!(s.flags & F_MANUAL_OVERRIDE));     // не «внешнее» изменение
+    s.v = s.alt = 51.0f; s.run(600000); CHECK(s.n_conn == 0);               // пауза держит мягкий порог
+    // но жёсткий порог перебивает ручное отключение
+    Sim h(fast()); h.reg = 1; h.v = h.alt = 47.0f; h.tick();
+    h.sv.manual_request(Cmd::Disconnect, h.t); h.run(60000); CHECK(h.n_disc == 0);
+    // ручное подключение выполняется при пониженной, но не критической батарее
+    Sim c2(fast()); c2.reg = 0; c2.v = c2.alt = 53.0f; c2.tick();
+    c2.sv.manual_request(Cmd::Connect, c2.t); d = c2.tick(); CHECK(d.cmd == Cmd::Connect && d.reason == Reason::Manual);
+}
+
 static std::vector<std::vector<double>> load_csv(const char* p) {
     std::vector<std::vector<double>> r; std::ifstream f(p); std::string line; std::getline(f, line);
     while (std::getline(f, line)) {
@@ -311,6 +326,7 @@ int main(int argc, char** argv) {
     test_stale_pending_is_not_confirmation(); test_step_gap(); test_boot_hold(); test_garbage_inputs();
     test_single_source_full(); test_validate_bounds(); test_connect_over_pending_disconnect(); test_cmd_reason_at_issue();
     test_retry_backoff_and_relay();
+    test_manual_request();
     test_incident_replay(argc > 1 ? argv[1] : "test/native/fixtures/incident_2026-10-01.csv");
     printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

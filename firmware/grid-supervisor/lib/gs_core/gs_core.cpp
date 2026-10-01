@@ -193,11 +193,16 @@ Decision Supervisor::step(const Input& in) {
         want = Cmd::Connect; why = Reason::SafeMode;                 // петля перезагрузок: сразу к сети
     } else if (no_data) {
         want = Cmd::Connect; why = Reason::NoData;                   // ничто не отменяет
+    } else if (manual_req_ == Cmd::Connect ||
+               (manual_req_ == Cmd::Disconnect && fresh && !doubtful && hard_since_ < 0 && soft_since_ < 0)) {
+        want = manual_req_; why = Reason::Manual;                    // человек: пауза уже включена в manual_request()
     } else if (!paused && soft_trip) {
         want = Cmd::Connect; why = Reason::SoftLow;
     } else if (!paused && fresh && off_trip && !hold && reg == 1 && !doubtful) {
         want = Cmd::Disconnect; why = Reason::Charged;
     }
+
+    if (manual_req_ != Cmd::None && why != Reason::Manual) manual_req_ = Cmd::None;   // защита перебила команду — не копим её
 
     // Устаревшее ожидание: желание изменилось — старый pending не должен «подтверждаться» позже.
     if (pending_ != Cmd::None && want != pending_) pending_ = Cmd::None;
@@ -237,6 +242,8 @@ Decision Supervisor::step(const Input& in) {
         last_cmd_disc_ms_ = static_cast<int64_t>(now);
     }
 
+    if (manual_req_ != Cmd::None && (issue != Cmd::None || (manual_req_ == Cmd::Connect && reg == 1) || (manual_req_ == Cmd::Disconnect && reg == 0)))
+        manual_req_ = Cmd::None;      // выдана (или уже в нужном состоянии)
     d.cmd = issue;
     d.reason = (issue == Cmd::None) ? Reason::None : why;
     d.flags = flags;

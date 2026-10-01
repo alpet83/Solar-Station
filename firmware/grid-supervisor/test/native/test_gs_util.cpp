@@ -45,7 +45,16 @@ int main() {
     sv.epoch_s = -1; m = state_to_json(sv, out, sizeof out);
     CHECK(m > 0 && strstr(out, "\"ts\":null") && strstr(out, "\"ntp_synced\":false"));
     CHECK(state_to_json(sv, tiny, sizeof tiny) == 0);
-    printf("%s\n", out);
+    {
+        Event ev[2]; ev[0].id = 2; ev[0].cmd = Cmd::Connect; ev[0].reason = Reason::HardFloor; ev[0].epoch_s = 1790826665; ev[0].v = 46.0f; ev[0].ok = true;
+        ev[1].id = 1; ev[1].cmd = Cmd::Disconnect; ev[1].reason = Reason::Charged;
+        sv.events = ev; sv.n_events = 2; sv.epoch_s = 1790826665;
+        char big[2000]; size_t k = state_to_json(sv, big, sizeof big);
+        CHECK(k > 0 && big[k - 1] == '}' && strstr(big, "\"events\":[{\"id\":2,\"cmd\":\"CONNECT\",\"reason\":\"HARD_FLOOR\"") && strstr(big, "\"ts\":null"));
+        CHECK(strlen(big) == k);
+        CHECK(state_to_json(sv, big, 500) == 0);
+        printf("%s\n", big);
+    }
 
     // атомарный набор: сдвиг всех порогов, недостижимый пошагово от значений по умолчанию
     {
