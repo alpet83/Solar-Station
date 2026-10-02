@@ -36,4 +36,11 @@ bool sniff_only();                             // режим «только пр
 typedef size_t (*SniffProvider)(char* out, size_t cap);
 void set_sniff_provider(SniffProvider p);
 
+// Для световой индикации (без блокировок).
+enum class Link : uint8_t { Offline = 0, Ap, Connected };
+Link link_state();
+uint64_t api_age_ms();                         // давность последнего авторизованного запроса к /api/* (UINT64_MAX — не было)
+void set_mqtt_ok(bool ok);                     // зарезервировано под MQTT на плате; пока не вызывается
+bool mqtt_bad();
+
 }  // namespace shell

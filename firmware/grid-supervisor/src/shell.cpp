@@ -24,6 +24,8 @@ static std::atomic<int64_t> g_ext_at_ms{-1};
 static std::atomic<bool> g_ota_active{false};
 static std::atomic<int> g_manual{-1};
 static std::atomic<bool> g_sniff_only{false};
+static std::atomic<int64_t> g_api_at_ms{-1};
+static std::atomic<bool> g_mqtt_bad{false};
 static shell::SniffProvider g_sniff_prov = nullptr;
 static std::atomic<uint64_t> g_hb_ms{0};
 static std::atomic<uint32_t> g_publishes{0};
@@ -96,6 +98,11 @@ bool ext_charge(float& a, uint64_t& age_ms) {
     return true;
 }
 
+static void touch_api() { g_api_at_ms.store((int64_t)(esp_timer_get_time() / 1000)); }
+Link link_state() { return WiFi.status() == WL_CONNECTED ? Link::Connected : (g_ap_mode ? Link::Ap : Link::Offline); }
+uint64_t api_age_ms() { int64_t a = g_api_at_ms.load(); int64_t n = (int64_t)(esp_timer_get_time() / 1000); return a < 0 ? UINT64_MAX : (uint64_t)(n - a); }
+void set_mqtt_ok(bool ok) { g_mqtt_bad.store(!ok); }
+bool mqtt_bad() { return g_mqtt_bad.load(); }
 bool sniff_only() { return g_sniff_only.load(); }
 void set_sniff_provider(SniffProvider p) { g_sniff_prov = p; }
 int take_manual() { return g_manual.exchange(-1); }
@@ -147,6 +154,7 @@ static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 
 
 static void h_state() {
     if (!authed(false)) return;
+    touch_api();
     static char buf[2800];
     static Snapshot s;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
@@ -160,6 +168,7 @@ static void h_state() {
 
 static void h_config_get() {
     if (!authed(false)) return;
+    touch_api();
     static char buf[1400];
     gs::Config c;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
@@ -172,6 +181,7 @@ static void h_config_get() {
 // Набор применяется АТОМАРНО: либо вся конфигурация валидна, либо ничего не меняется.
 static void h_config_set() {
     if (!authed(true)) return;
+    touch_api();
     const char* keys[32]; String vals[32]; const char* vp[32]; size_t n = 0;
     for (int i = 0; i < g_http.args() && n < 32; ++i) {
         String name = g_http.argName(i);
@@ -201,6 +211,7 @@ static void h_ext() {
     bool tok = g_xtok.length() >= 16 && g_http.hasHeader("X-GS-Token") && ct_equal(g_http.header("X-GS-Token"), g_xtok)
                && g_http.hasHeader("X-GS");
     if (!tok && !authed(true)) return;
+    touch_api();
     float a;
     if (!gs::parse_ext_current(g_http.arg("a").c_str(), a)) { g_http.send(400, "text/plain", "bad value"); return; }
     uint32_t bits; memcpy(&bits, &a, 4);
@@ -212,6 +223,7 @@ static void h_ext() {
 // автоматики; защиты (hard-floor и др.) команду при необходимости перебивают.
 static void h_cmd() {
     if (!authed(true)) return;
+    touch_api();
     if (g_sniff_only.load()) { g_http.send(409, "text/plain", "sniff mode: control disabled"); return; }
     String v = g_http.arg("ongrid");
     if (v != "0" && v != "1") { g_http.send(400, "text/plain", "ongrid must be 0 or 1"); return; }
@@ -222,6 +234,7 @@ static void h_cmd() {
 // GET /api/sniff — ритм логгера и последние кадры шины (готовый JSON от задачи шины).
 static void h_sniff() {
     if (!authed(false)) return;
+    touch_api();
     if (!g_sniff_prov) { g_http.send(404, "text/plain", "no sniffer"); return; }
     const size_t cap = 9000;
     char* buf = (char*)malloc(cap);
@@ -253,6 +266,7 @@ static void h_mode() {
 // диапазон не опрашивается; age_ms в ответе — возраст блока, свежесть проверяет потребитель.
 static void h_regs() {
     if (!authed(false)) return;
+    touch_api();
     long addr = g_http.arg("addr").toInt(), cnt = g_http.arg("count").toInt();
     if (addr < 0 || addr > 65535 || cnt < 1 || cnt > gs::kMaxBlockRegs) { g_http.send(400, "text/plain", "bad range"); return; }
     static Snapshot s;

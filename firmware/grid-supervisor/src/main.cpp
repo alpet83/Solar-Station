@@ -10,6 +10,8 @@
 
 #include "gs_bus.h"
 #include "gs_core.h"
+#include "gs_led.h"
+#include <atomic>
 #include "gs_modbus.h"
 #include "shell.h"
 #include <ctime>
@@ -28,6 +30,12 @@
 #endif
 #ifndef GS_PIN_5V_EN
 #define GS_PIN_5V_EN 16
+#endif
+#ifndef GS_PIN_LED          // WS2812 на T-CAN485 (GPIO4 по схеме платы — проверить)
+#define GS_PIN_LED 4
+#endif
+#ifndef GS_LED_BRIGHT       // 0..255: общая яркость (индикатор не должен слепить ночью)
+#define GS_LED_BRIGHT 40
 #endif
 #ifndef GS_BAUD
 #define GS_BAUD 19200
@@ -52,6 +60,8 @@ static gs::BusSniffer g_sn(6);
 static gs::LoggerTracker g_trk;
 static const uint32_t kPollPeriodActiveMs = 3000;   // между пачками логгера опрашиваем чаще
 static const uint32_t kPollNeedMs = 3500;           // сколько тишины нужно для одного цикла опроса
+static std::atomic<uint8_t> g_inv_state{(uint8_t)gs::InvState::NoLink};   // для светодиода
+static std::atomic<int64_t> g_last_rt_ok_ms{-1};
 static char g_sniff_json[9000];
 static size_t g_sniff_len = 0;
 static SemaphoreHandle_t g_sniff_mtx;
@@ -224,7 +234,7 @@ static void poll_inverter(bool do_poll) {
     g_tel = gs::Telemetry();
     if (!do_poll) return;
     const uint32_t t0 = millis();
-    if (read_block(gs::kBlockRtAddr, gs::kBlockRtCount, rt)) gs::decode_rt(rt, g_tel);
+    if (read_block(gs::kBlockRtAddr, gs::kBlockRtCount, rt)) { gs::decode_rt(rt, g_tel); g_last_rt_ok_ms.store((int64_t)up_ms()); }
     bus_delay(kBlockSpacingMs);
     if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockChgAddr, gs::kBlockChgCount, chg)) gs::decode_chg(chg, g_tel);
     bus_delay(kBlockSpacingMs);
@@ -295,6 +305,21 @@ static void gs_task(void*) {
                       g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid,
                       (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc);
 
+        {   // состояние инвертора для светодиода: связь = блок реального времени читался за последние 45 с
+            const int64_t last = g_last_rt_ok_ms.load();
+            const bool link = last >= 0 && (int64_t)now_ms - last <= 45000;
+            const uint32_t problem_mask = gs::F_HARD_LOW | gs::F_SOFT_LOW | gs::F_NO_DATA | gs::F_DATA_DOUBTFUL | gs::F_GRID_LOST_LOW |
+                                          gs::F_SAFE_MODE | gs::F_CMD_RETRY | gs::F_RELAY_MISMATCH | gs::F_TIME_JUMP | gs::F_SINGLE_SRC;
+            gs::InvState st;
+            if (sniff_only) st = gs::InvState::Sniff;
+            else if (!link) st = gs::InvState::NoLink;
+            else if ((d.flags & problem_mask) || g_safe_mode) st = gs::InvState::Problem;
+            else {
+                const int on = g_tel.ongrid_reg >= 0 ? g_tel.ongrid_reg : (g_tel.relay_grid >= 0 ? g_tel.relay_grid : 1);
+                st = on ? gs::InvState::OkGrid : gs::InvState::OkOff;
+            }
+            g_inv_state.store((uint8_t)st);
+        }
         static shell::Snapshot s;
         s.tel = g_tel; s.dec = d; s.in = in; s.uptime_ms = now_ms; s.seq = ++seq; s.safe_mode = g_safe_mode; s.sniff_only = sniff_only;
         s.paused = (d.flags & gs::F_MANUAL_PAUSE) != 0;
@@ -308,6 +333,28 @@ static void gs_task(void*) {
         shell::mark_healthy(seq);
         // оболочка зависла надолго — перезапуск (SW-сброс не считается аварийным; ядро безопасно стартует в сторону сети)
         if (shell::heartbeat_age_ms() > 900000) { Serial.println("shell stalled -> restart"); delay(100); ESP.restart(); }
+    }
+}
+
+// Светодиод: отдельная задача низкого приоритета, не влияет на ядро и не блокируется оболочкой.
+static void led_task(void*) {
+    gs::Rgb last; bool first = true;
+    for (;;) {
+        gs::LedStatus st;
+        switch (shell::link_state()) {
+            case shell::Link::Connected: st.net = gs::NetState::Connected; break;
+            case shell::Link::Ap: st.net = gs::NetState::Ap; break;
+            default: st.net = gs::NetState::Offline;
+        }
+        st.api_recent = shell::api_age_ms() < 60000;
+        st.mqtt_bad = shell::mqtt_bad();
+        st.inv = (gs::InvState)g_inv_state.load();
+        gs::Rgb c = gs::led_color(st, (uint32_t)(esp_timer_get_time() / 1000));
+        if (first || !(c == last)) {
+            neopixelWrite(GS_PIN_LED, (uint8_t)((c.r * GS_LED_BRIGHT) / 255), (uint8_t)((c.g * GS_LED_BRIGHT) / 255), (uint8_t)((c.b * GS_LED_BRIGHT) / 255));
+            last = c; first = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 }
 
@@ -333,6 +380,7 @@ void setup() {
     shell::begin(esp_random());
     Serial.printf("gs boot: reset=%d short_boots=%u safe=%d\n", (int)esp_reset_reason(), (unsigned)rtc_short_boots, g_safe_mode);
     xTaskCreatePinnedToCore(gs_task, "gs_core", 8192, nullptr, 3, nullptr, 1);
+    xTaskCreatePinnedToCore(led_task, "gs_led", 3072, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
