@@ -101,6 +101,8 @@ void LoggerTracker::observe(const FrameRec& f, uint64_t t) {
 }
 
 bool LoggerTracker::in_burst(uint64_t now) const {
+    // Бесконечный чужой опрос (не логгер) не должен глушить нас навсегда: после burst_max_ms «пачка» не гейтит.
+    if (open_ && cur_last_ >= cur_start_ && cur_last_ - cur_start_ > cfg_.burst_max_ms) return false;
     return seen_any_ && (now < last_req_ || now - last_req_ < cfg_.post_guard_ms + (open_ ? cfg_.burst_gap_ms : 0));
 }
 
@@ -130,6 +132,7 @@ void LoggerTracker::close_burst() {
             if (inphase_ >= 2) locked_ = true;
         } else {
             ++off_;
+            if (!locked_) { ref_ = cur_start_; inphase_ = 0; miss_ = 0; last_checked_ = cur_start_; }   // чужая «опора» не должна блокировать захват
         }
     }
     r.in_phase = in_phase;

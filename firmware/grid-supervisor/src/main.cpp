@@ -52,7 +52,6 @@ static gs::BusSniffer g_sn(6);
 static gs::LoggerTracker g_trk;
 static const uint32_t kPollPeriodActiveMs = 3000;   // между пачками логгера опрашиваем чаще
 static const uint32_t kPollNeedMs = 3500;           // сколько тишины нужно для одного цикла опроса
-static const uint32_t kReuseMs = 45000;             // пропущенный опрос: блок живёт ещё столько
 static char g_sniff_json[9000];
 static size_t g_sniff_len = 0;
 static SemaphoreHandle_t g_sniff_mtx;
@@ -218,36 +217,33 @@ static bool write_ongrid(bool connect) {
     return false;
 }
 
-// Опрос с «живыми» кусками: блок, который не удалось/не стали читать, переиспользуется до
-// kReuseMs — иначе пропущенный из-за логгера цикл обнулял бы данные и сбрасывал выдержки ядра.
+// Решения принимаются только по блокам, прочитанным в ЭТОМ цикле: пропущенный (из-за логгера)
+// или неудавшийся опрос = нет данных; ядро само сбрасывает выдержку «заряжено» и считает no_data.
 static void poll_inverter(bool do_poll) {
     static uint16_t rt[gs::kBlockRtCount], chg[gs::kBlockChgCount], cfg[gs::kBlockCfgCount];
-    static uint64_t at_rt = 0, at_chg = 0, at_cfg = 0; static bool has_rt = false, has_chg = false, has_cfg = false;
-    if (do_poll) {
-        const uint32_t t0 = millis();
-        if (read_block(gs::kBlockRtAddr, gs::kBlockRtCount, rt)) { has_rt = true; at_rt = up_ms(); }
-        bus_delay(kBlockSpacingMs);
-        if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockChgAddr, gs::kBlockChgCount, chg)) { has_chg = true; at_chg = up_ms(); }
-        bus_delay(kBlockSpacingMs);
-        if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockCfgAddr, gs::kBlockCfgCount, cfg)) { has_cfg = true; at_cfg = up_ms(); }
-    }
     g_tel = gs::Telemetry();
-    const uint64_t now = up_ms();
-    if (has_rt && now - at_rt <= kReuseMs) gs::decode_rt(rt, g_tel);
-    if (has_chg && now - at_chg <= kReuseMs) gs::decode_chg(chg, g_tel);
-    if (has_cfg && now - at_cfg <= kReuseMs) gs::decode_cfg(cfg, g_tel);
+    if (!do_poll) return;
+    const uint32_t t0 = millis();
+    if (read_block(gs::kBlockRtAddr, gs::kBlockRtCount, rt)) gs::decode_rt(rt, g_tel);
+    bus_delay(kBlockSpacingMs);
+    if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockChgAddr, gs::kBlockChgCount, chg)) gs::decode_chg(chg, g_tel);
+    bus_delay(kBlockSpacingMs);
+    if (millis() - t0 < kPollBudgetMs && read_block(gs::kBlockCfgAddr, gs::kBlockCfgCount, cfg)) gs::decode_cfg(cfg, g_tel);
 }
 
 // Медленные блоки (идентификация, калибровка, параметры заряда): нужны только кэшу /api/regs для
 // pv1800_ctrl.py; читаются при старте и затем раз в 5 минут, при неудаче — повтор через 30 с.
 static void poll_slow() {
     static uint32_t next = 0;
-    if (!g_trk.may_transmit(up_ms(), 6000).ok) return;       // длинная серия: только вне пачки логгера
     static const struct { uint16_t addr, cnt; } blocks[] = {{20000, 16}, {10001, 8}, {10101, 23}};
     if ((int32_t)(millis() - next) < 0) return;
     static uint16_t tmp[gs::kMaxBlockRegs];
     bool all = true;
-    for (auto& b : blocks) { bus_delay(kBlockSpacingMs); all &= read_block(b.addr, b.cnt, tmp); }
+    for (auto& b : blocks) {
+        bus_delay(kBlockSpacingMs);
+        if (!g_trk.may_transmit(up_ms(), 2500).ok) { all = false; break; }   // каждый блок отдельно вне пачки логгера
+        all &= read_block(b.addr, b.cnt, tmp);
+    }
     next = millis() + (all ? 300000u : 30000u);
 }
 
@@ -268,9 +264,10 @@ static void gs_task(void*) {
 
         gs::Config nc;
         if (shell::take_config(nc)) g_sv.set_config(nc);
-        { int mc = shell::take_manual(); if (mc >= 0) g_sv.manual_request(mc ? gs::Cmd::Connect : gs::Cmd::Disconnect, now_ms); }
+        { int mc = shell::take_manual(); if (mc >= 0 && !shell::sniff_only()) g_sv.manual_request(mc ? gs::Cmd::Connect : gs::Cmd::Disconnect, now_ms); }
 
-        const bool sniff_only = shell::sniff_only();
+        // safe-mode после аварийных перезагрузок отменяет режим приёма: защиты (возврат в сеть) важнее
+        const bool sniff_only = shell::sniff_only() && !g_safe_mode;
         if (sniff_only || shell::ota_active()) {
             g_tel = gs::Telemetry();                       // на шину не передаём
         } else {

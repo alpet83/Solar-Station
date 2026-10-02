@@ -203,6 +203,7 @@ static void h_ext() {
 // автоматики; защиты (hard-floor и др.) команду при необходимости перебивают.
 static void h_cmd() {
     if (!authed(true)) return;
+    if (g_sniff_only.load()) { g_http.send(409, "text/plain", "sniff mode: control disabled"); return; }
     String v = g_http.arg("ongrid");
     if (v != "0" && v != "1") { g_http.send(400, "text/plain", "ongrid must be 0 or 1"); return; }
     g_manual.store(v.toInt());
@@ -228,6 +229,12 @@ static void h_mode() {
     if (!authed(true)) return;
     String m = g_http.arg("m");
     if (m != "sniff" && m != "normal") { g_http.send(400, "text/plain", "m must be sniff or normal"); return; }
+    if (m == "sniff") {            // в режиме приёма защит нет: не входим, пока сеть отключена
+        static Snapshot s;
+        if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
+        s = g_snap; xSemaphoreGive(g_mtx);
+        if (s.tel.ongrid_reg != 1) { g_http.send(409, "text/plain", "grid must be connected (20105=1) to enter sniff mode"); return; }
+    }
     Preferences p; p.begin("gs", false); p.putBool("sniff", m == "sniff"); p.end();
     g_sniff_only.store(m == "sniff");
     g_http.send(200, "text/plain", "ok");

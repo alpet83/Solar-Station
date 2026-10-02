@@ -116,8 +116,25 @@ static void test_tracker_misc() {
     CHECK(!tr.ignore(3, 99, 1));                                                    // переполнение списка безопасно
 }
 
+static void test_endless_and_reref() {
+    {   // бесконечный чужой опрос: после burst_max_ms гейт не глушит навсегда
+        LoggerTracker tr; FrameRec f; f.kind = FrameKind::Request; f.id = 4; f.fn = 3; f.addr = 777; f.count = 5; f.crc_ok = true;
+        uint64_t t = 1000;
+        for (; t < 1000 + 200000; t += 2000) tr.observe(f, t);
+        CHECK(tr.may_transmit(t, 100).ok);
+    }
+    {   // первая чужая пачка не блокирует захват на час
+        LoggerTracker tr; FrameRec f; f.kind = FrameKind::Request; f.id = 4; f.fn = 3; f.addr = 20001; f.count = 16; f.crc_ok = true;
+        tr.observe(f, 1000);
+        const uint64_t base = 100000;
+        for (int i = 0; i < 4; ++i) { for (int j = 0; j < 3; ++j) tr.observe(f, base + i * 300000ull + j * 800); tr.tick(base + i * 300000ull + 20000); }
+        tr.tick(base + 4 * 300000ull);
+        CHECK(tr.locked());
+    }
+}
+
 int main() {
-    test_classify(); test_sniffer(); test_tracker(); test_tracker_misc();
+    test_classify(); test_sniffer(); test_tracker(); test_tracker_misc(); test_endless_and_reref();
     printf("bus: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
