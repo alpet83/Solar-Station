@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "gs_core.h"
+#include "gs_bus.h"
 #include "gs_modbus.h"
 
 namespace gs {
@@ -44,9 +45,15 @@ struct StateView {
     bool paused; uint64_t pause_left_ms;
     uint32_t rx_ok, rx_err, rx_foreign, rx_busy, rx_exc;
     const Event* events = nullptr; size_t n_events = 0;     // от новых к старым
+    bool sniff_only = false;                                // режим «только приём»: управление сетью выключено
 };
 // JSON состояния. Время — UTC: epoch в "t" и ISO в "ts" (только если epoch_s >= 0).
 size_t state_to_json(const StateView& s, char* out, size_t cap);
+
+// JSON для /api/sniff: итог по ритму логгера, последние пачки и кадры (времена — «сколько мс
+// назад» от now_ms, плюс UTC-метка, если известно epoch_now_s >= 0). 0 — не влезло в буфер.
+size_t sniff_to_json(const BusSniffer& sn, const LoggerTracker& tr, uint64_t now_ms, int64_t epoch_now_s,
+                     size_t n_frames, size_t n_bursts, char* out, size_t cap);
 
 // JSON ответа /api/regs: {"addr":..,"count":..,"age_ms":..,"regs":[..]}. 0 — не влезло в буфер.
 size_t regs_to_json(uint16_t addr, uint16_t count, uint64_t age_ms, const uint16_t* regs, char* out, size_t cap);

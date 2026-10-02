@@ -13,7 +13,7 @@ namespace shell {
 struct Snapshot {
     gs::Telemetry tel; gs::Decision dec; gs::Input in;
     uint64_t uptime_ms = 0; uint32_t seq = 0; bool safe_mode = false;
-    bool paused = false; uint64_t pause_left_ms = 0;
+    bool paused = false; uint64_t pause_left_ms = 0; bool sniff_only = false;
     uint32_t rx_ok = 0, rx_err = 0, rx_foreign = 0, rx_busy = 0, rx_exc = 0;
     gs::RegCache cache;
     gs::Event events[gs::kEventCap]; size_t n_events = 0;     // от новых к старым
@@ -30,5 +30,10 @@ int take_manual();                             // -1 нет, 0 = OFF-grid, 1 = O
 bool ota_active();                             // идёт загрузка образа: ядру не передавать на шину
 uint64_t heartbeat_age_ms();                   // сколько оболочка не вызывала loop()
 void mark_healthy(uint32_t publishes);         // ядро сообщает число успешных циклов (критерий валидности OTA-образа)
+
+bool sniff_only();                             // режим «только приём» (в NVS, переживает перезагрузку)
+// Провайдер JSON для /api/sniff: копирует готовый текст в буфер, возвращает длину (0 — нет данных).
+typedef size_t (*SniffProvider)(char* out, size_t cap);
+void set_sniff_provider(SniffProvider p);
 
 }  // namespace shell

@@ -132,7 +132,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         "\"voltages\":{\"battery\":%s,\"alt\":%s,\"grid\":%s},\"charge_a\":%s,\"load_w\":%s,"
         "\"ongrid_reg\":%d,\"relay_grid\":%d,\"rt_ok\":%s,\"chg_ok\":%s,\"cfg_ok\":%s,"
         "\"decision\":{\"v_used\":%s,\"eff_charge_a\":%s,\"pow_min_w\":%s,\"flags\":\"%s\",\"flags_raw\":%lu},"
-        "\"safe_mode\":%s,\"paused\":%s,\"pause_left_s\":%llu,"
+        "\"mode\":\"%s\",\"safe_mode\":%s,\"paused\":%s,\"pause_left_s\":%llu,"
         "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu},\"events\":[",
         (unsigned long)s.seq, (unsigned long)s.boot_id, (unsigned long long)s.uptime_ms,
         s.epoch_s >= 0 ? "true" : "false", (long long)s.epoch_s,
@@ -140,7 +140,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         vp, va, gv, ch, ld, (int)s.tel->ongrid_reg, (int)s.tel->relay_grid,
         s.tel->rt_ok ? "true" : "false", s.tel->chg_ok ? "true" : "false", s.tel->cfg_ok ? "true" : "false",
         vu, ef, pm, fl, (unsigned long)s.dec->flags,
-        s.safe_mode ? "true" : "false", s.paused ? "true" : "false", (unsigned long long)(s.pause_left_ms / 1000),
+        s.sniff_only ? "sniff" : "normal", s.safe_mode ? "true" : "false", s.paused ? "true" : "false", (unsigned long long)(s.pause_left_ms / 1000),
         (unsigned long)s.rx_ok, (unsigned long)s.rx_err, (unsigned long)s.rx_foreign, (unsigned long)s.rx_busy,
         (unsigned long)s.rx_exc);
     if (w < 0 || (size_t)w >= cap) { if (cap) out[0] = 0; return 0; }
@@ -162,6 +162,55 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
     }
     if (n + 3 > cap) { if (cap) out[0] = 0; return 0; }
     out[n++] = ']'; out[n++] = '}'; out[n] = 0;
+    return n;
+}
+
+static const char* kind_name(FrameKind k) {
+    switch (k) { case FrameKind::Request: return "req"; case FrameKind::Response: return "resp"; case FrameKind::Exception: return "exc";
+                 case FrameKind::WriteEcho: return "wr"; default: return "junk"; }
+}
+
+static void ts_str(char* out, size_t cap, int64_t epoch_s) {
+    if (epoch_s < 0) { snprintf(out, cap, "null"); return; }
+    time_t t = (time_t)epoch_s; struct tm tmv; gmtime_r(&t, &tmv);
+    snprintf(out, cap, "\"%04d-%02d-%02d %02d:%02d:%02d\"", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+size_t sniff_to_json(const BusSniffer& sn, const LoggerTracker& tr, uint64_t now_ms, int64_t epoch_now_s,
+                     size_t n_frames, size_t n_bursts, char* out, size_t cap) {
+    size_t n = 0;
+    auto put = [&](const char* fmt, auto... a) -> bool {
+        if (n >= cap) return false;
+        int w = snprintf(out + n, cap - n, fmt, a...);
+        if (w < 0 || (size_t)w >= cap - n) return false;
+        n += (size_t)w; return true;
+    };
+    uint64_t nt = 0; char nxt[24];
+    if (tr.next_start(now_ms, nt)) snprintf(nxt, sizeof nxt, "%lld", (long long)((int64_t)nt - (int64_t)now_ms));
+    else snprintf(nxt, sizeof nxt, "null");
+    const uint32_t now32 = (uint32_t)now_ms;
+    bool ok = put("{\"locked\":%s,\"period_ms\":%lu,\"burst_len_ms\":%lu,\"bursts_total\":%lu,\"off_rhythm\":%lu,\"ignored_reqs\":%lu,"
+                  "\"active_window\":%s,\"next_start_in_ms\":%s,\"frames_total\":%lu,\"junk\":%lu,\"bursts\":[",
+                  tr.locked() ? "true" : "false", (unsigned long)tr.period_ms(), (unsigned long)tr.burst_len_ms(),
+                  (unsigned long)tr.bursts_total(), (unsigned long)tr.off_rhythm(), (unsigned long)tr.ignored(),
+                  tr.active_window(now_ms) ? "true" : "false", nxt, (unsigned long)sn.total(), (unsigned long)sn.junk());
+    for (size_t i = 0; ok && i < n_bursts; ++i) {
+        BurstRec b; if (!tr.burst(i, b)) break;
+        uint32_t ago = now32 - b.start_ms; char ts[28];
+        ts_str(ts, sizeof ts, epoch_now_s >= 0 ? epoch_now_s - (int64_t)(ago / 1000) : -1);
+        ok = put("%s{\"ago_ms\":%lu,\"ts\":%s,\"dur_ms\":%lu,\"n_req\":%u,\"first_addr\":%u,\"in_phase\":%s}",
+                 i ? "," : "", (unsigned long)ago, ts, (unsigned long)b.dur_ms, (unsigned)b.n_req, (unsigned)b.first_addr,
+                 b.in_phase ? "true" : "false");
+    }
+    ok = ok && put("%s", "],\"frames\":[");
+    for (size_t i = 0; ok && i < n_frames; ++i) {
+        FrameRec f; if (!sn.recent(i, f)) break;
+        ok = put("%s{\"ago_ms\":%lu,\"dur_ms\":%u,\"len\":%u,\"kind\":\"%s\",\"id\":%u,\"fn\":%u,\"addr\":%u,\"count\":%u,\"crc\":%s}",
+                 i ? "," : "", (unsigned long)(now32 - f.t_ms), (unsigned)f.dur_ms, (unsigned)f.len, kind_name(f.kind),
+                 (unsigned)f.id, (unsigned)f.fn, (unsigned)f.addr, (unsigned)f.count, f.crc_ok ? "true" : "false");
+    }
+    ok = ok && put("]}");
+    if (!ok) { if (cap) out[0] = 0; return 0; }
     return n;
 }
 

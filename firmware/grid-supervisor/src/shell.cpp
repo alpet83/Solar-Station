@@ -23,6 +23,8 @@ static std::atomic<uint32_t> g_ext_bits{0};        // float как биты — 
 static std::atomic<int64_t> g_ext_at_ms{-1};
 static std::atomic<bool> g_ota_active{false};
 static std::atomic<int> g_manual{-1};
+static std::atomic<bool> g_sniff_only{false};
+static shell::SniffProvider g_sniff_prov = nullptr;
 static std::atomic<uint64_t> g_hb_ms{0};
 static std::atomic<uint32_t> g_publishes{0};
 static String g_xtok;                 // токен только для /api/ext (отдельная роль для Pi)
@@ -85,6 +87,8 @@ bool ext_charge(float& a, uint64_t& age_ms) {
     return true;
 }
 
+bool sniff_only() { return g_sniff_only.load(); }
+void set_sniff_provider(SniffProvider p) { g_sniff_prov = p; }
 int take_manual() { return g_manual.exchange(-1); }
 bool ota_active() { return g_ota_active.load(); }
 uint64_t heartbeat_age_ms() { uint64_t h = g_hb_ms.load(); return h ? now_ms() - h : 0; }
@@ -139,7 +143,7 @@ static void h_state() {
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
     s = g_snap; xSemaphoreGive(g_mtx);
     gs::StateView v{&s.tel, &s.dec, &s.in, s.uptime_ms, s.seq, g_boot_id, s.safe_mode, epoch_or_neg(),
-                    s.paused, s.pause_left_ms, s.rx_ok, s.rx_err, s.rx_foreign, s.rx_busy, s.rx_exc, s.events, s.n_events};
+                    s.paused, s.pause_left_ms, s.rx_ok, s.rx_err, s.rx_foreign, s.rx_busy, s.rx_exc, s.events, s.n_events, s.sniff_only};
     size_t n = gs::state_to_json(v, buf, sizeof buf);
     g_http.sendHeader("Cache-Control", "no-store");
     g_http.send(n ? 200 : 500, "application/json", n ? buf : "{}");
@@ -205,6 +209,30 @@ static void h_cmd() {
     g_http.send(200, "text/plain", "queued");
 }
 
+// GET /api/sniff — ритм логгера и последние кадры шины (готовый JSON от задачи шины).
+static void h_sniff() {
+    if (!authed(false)) return;
+    if (!g_sniff_prov) { g_http.send(404, "text/plain", "no sniffer"); return; }
+    const size_t cap = 9000;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { g_http.send(503, "text/plain", "nomem"); return; }
+    size_t n = g_sniff_prov(buf, cap);
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
+    free(buf);
+}
+
+// POST /api/mode  m=sniff|normal — режим только приёма (управление сетью выключено, на шину не
+// передаём; Pi продолжает управлять сам). Сохраняется в NVS.
+static void h_mode() {
+    if (!authed(true)) return;
+    String m = g_http.arg("m");
+    if (m != "sniff" && m != "normal") { g_http.send(400, "text/plain", "m must be sniff or normal"); return; }
+    Preferences p; p.begin("gs", false); p.putBool("sniff", m == "sniff"); p.end();
+    g_sniff_only.store(m == "sniff");
+    g_http.send(200, "text/plain", "ok");
+}
+
 // GET /api/regs?addr=25201&count=79 — сырые регистры из кэша (без обращения к шине). 404, если
 // диапазон не опрашивается; age_ms в ответе — возраст блока, свежесть проверяет потребитель.
 static void h_regs() {
@@ -228,7 +256,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { if (authed(false)) g_http.send_P(200, "text/html", kIndex); }
 
@@ -362,6 +390,7 @@ void begin(uint32_t boot_id) {
     g_mtx = xSemaphoreCreateMutex();
     factory_reset_if_requested();
     g_cfg = load_config();
+    { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); p.end(); }
     connect_sta();
     configTime(0, 0, "pool.ntp.org", "time.google.com");     // всё время — UTC
     const char* hdr[] = {"X-GS", "X-GS-Token", "Authorization"};
@@ -373,6 +402,8 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/config", HTTP_POST, h_config_set);
     g_http.on("/api/ext", HTTP_POST, h_ext);
     g_http.on("/api/cmd", HTTP_POST, h_cmd);
+    g_http.on("/api/sniff", HTTP_GET, h_sniff);
+    g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/setup", HTTP_ANY, h_setup);
     g_http.on("/update", HTTP_GET, h_update_form);
     g_http.on("/update", HTTP_POST, h_update_done, h_update_upload);

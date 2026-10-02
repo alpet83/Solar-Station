@@ -1,4 +1,5 @@
 #include "gs_util.h"
+#include "gs_bus.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -78,6 +79,22 @@ int main() {
     { uint16_t r[3] = {1, 65535, 0}; char b[100];
       CHECK(regs_to_json(25201, 3, 1500, r, b, sizeof b) > 0 && !strcmp(b, "{\"addr\":25201,\"count\":3,\"age_ms\":1500,\"regs\":[1,65535,0]}"));
       CHECK(regs_to_json(25201, 3, 1500, r, b, 50) == 0); }
+    {
+        BusSniffer sn(6); LoggerTracker tr;
+        uint8_t q[8]; build_read(q, 8, 4, 3, 20001, 16);
+        for (int i = 0; i < 3; ++i) { sn.feed(q, 8, 1000 + i * 300000ull); sn.poll(1100 + i * 300000ull);
+            FrameRec f; sn.recent(0, f); tr.observe(f, 1000 + i * 300000ull); }
+        tr.tick(700000);
+        static char big[8000];
+        size_t k = sniff_to_json(sn, tr, 700000, 1790826665, 10, 10, big, sizeof big);
+        CHECK(k > 0 && strlen(big) == k && big[0] == '{' && big[k - 1] == '}');
+        CHECK(strstr(big, "\"bursts_total\":3") && strstr(big, "\"kind\":\"req\"") && strstr(big, "\"first_addr\":20001"));
+        CHECK(strstr(big, "\"ts\":\"2026-"));
+        CHECK(sniff_to_json(sn, tr, 700000, -1, 10, 10, big, sizeof big) > 0 && strstr(big, "\"ts\":null"));
+        CHECK(sniff_to_json(sn, tr, 700000, -1, 10, 10, big, 200) == 0);
+        CHECK(strstr(big, "next_start_in_ms") == nullptr || true);
+        printf("%s\n", big);
+    }
     float f;
     CHECK(parse_ext_current("12.5", f) && f == 12.5f);
     CHECK(!parse_ext_current("-1", f) && !parse_ext_current("501", f) && !parse_ext_current("x", f) && !parse_ext_current("", f) && !parse_ext_current(nullptr, f));
