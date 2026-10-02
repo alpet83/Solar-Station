@@ -34,6 +34,15 @@ static String g_http_pass;            // пусто = пароль не зада
 static bool g_ap_mode = false;
 static uint32_t g_wifi_try_ms = 0;
 static bool g_ever_connected = false;
+static const int kNets = 4;                 // основная + резервные сети, порядок = приоритет
+static String g_ssid[kNets], g_wpass[kNets];
+static int g_net_cur = -1;                   // индекс сети, к которой идёт/шла попытка
+static bool g_was_conn = false, g_scan_pending = false;
+static uint32_t g_scan_ms = 0, g_boot_ms = 0;
+#ifndef GS_REV
+#define GS_REV "dev"
+#endif
+static const char* kRev = GS_REV;
 static bool g_ota_validated = false;
 
 static uint64_t now_ms() { return (uint64_t)(esp_timer_get_time() / 1000); }
@@ -318,35 +327,74 @@ static void h_update_upload() {
 // Первичная настройка. Доступна, пока пароль администратора не задан; после этого — только
 // с паролем. Одноразовый токен формы защищает от кросс-сайтовой подмены (CSRF). Сброс
 // забытого пароля — удержанием BOOT при включении (см. factory_reset_if_requested).
+static String esc(const String& in) {
+    String o; o.reserve(in.length() + 8);
+    for (size_t k = 0; k < in.length(); ++k) {
+        char c = in[k];
+        if (c == '&') o += "&amp;"; else if (c == '<') o += "&lt;"; else if (c == '>') o += "&gt;";
+        else if (c == '"') o += "&quot;"; else if (c == '\'') o += "&#39;"; else o += c;
+    }
+    return o;
+}
+
 static void h_setup() {
     bool open_setup = g_http_pass.length() == 0;
     if (!open_setup && !basic_ok()) { g_http.requestAuthentication(); return; }
     if (g_http.method() == HTTP_GET) {
         char b[24]; snprintf(b, sizeof b, "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
         g_setup_token = b;
-        String page = String("<!doctype html><meta charset=utf-8><title>setup</title><h3>setup</h3>"
-            "<form method=post action=/setup><input type=hidden name=t value=") + g_setup_token +
-            ">SSID <input name=ssid><br>Wi-Fi password <input name=pass type=password><br>"
-            "Admin password (&gt;= 8) <input name=hpass type=password><br>"
-            "Ext token for Pi (&gt;= 16, optional) <input name=xtok type=password><br>"
-            "<input type=submit value=Save></form>";
+        Preferences p; p.begin("gs", true); String host = p.getString("host", "grid-supervisor"); p.end();
+        String page = String("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            "<title>setup</title><style>body{font:14px sans-serif;margin:12px}input{margin:2px 0}</style>"
+            "<h3>grid-supervisor setup</h3><p>rev ") + kRev + " · ";
+        if (WiFi.status() == WL_CONNECTED) page += "Wi-Fi: " + esc(WiFi.SSID()) + ", " + String(WiFi.RSSI()) + " dBm, " + WiFi.localIP().toString();
+        else page += g_ap_mode ? "Wi-Fi not connected (AP mode)" : "Wi-Fi not connected";
+        page += "</p><form method=post action=/setup><input type=hidden name=t value=" + g_setup_token + ">"
+                "<p>Wi-Fi networks by priority (1 = main, others = backup; empty SSID = remove; empty password = keep)</p>";
+        for (int k = 0; k < kNets; ++k)
+            page += String(k + 1) + ". SSID <input name=s" + k + " value=\"" + esc(g_ssid[k]) + "\" maxlength=32> password <input name=w" + k +
+                    " type=password placeholder=\"" + (g_ssid[k].length() ? "(unchanged)" : "") + "\" maxlength=63><br>";
+        page += "<p>Hostname <input name=host value=\"" + esc(host) + "\" maxlength=32><br>"
+                "Admin password (&gt;= 8" + String(open_setup ? ", required" : ", empty = keep") + ") <input name=hpass type=password><br>"
+                "Setup AP password (&gt;= 8, empty = keep) <input name=appass type=password><br>"
+                "Ext token for Pi (&gt;= 16, empty = keep) <input name=xtok type=password></p>"
+                "<input type=submit value=\"Save and reboot\"></form>";
         g_http.send(200, "text/html", page);
         return;
     }
     if (!g_setup_token.length() || !ct_equal(g_http.arg("t"), g_setup_token)) { g_http.send(403, "text/plain", "bad token"); return; }
     g_setup_token = "";
-    String hp = g_http.arg("hpass"), xt = g_http.arg("xtok");
+    String hp = g_http.arg("hpass"), xt = g_http.arg("xtok"), ap = g_http.arg("appass"), host = g_http.arg("host");
     if (hp.length() && hp.length() < 8) { g_http.send(400, "text/plain", "admin password too short"); return; }
+    if (ap.length() && ap.length() < 8) { g_http.send(400, "text/plain", "AP password too short"); return; }
     if (xt.length() && xt.length() < 16) { g_http.send(400, "text/plain", "ext token too short"); return; }
     if (open_setup && !hp.length()) { g_http.send(400, "text/plain", "admin password required"); return; }
-    bool changed = false;
+    for (int k = 0; k < kNets; ++k) {
+        if (g_http.arg("s" + String(k)).length() > 32 || g_http.arg("w" + String(k)).length() > 63) { g_http.send(400, "text/plain", "ssid/password too long"); return; }
+    }
+    if (host.length() > 32) { g_http.send(400, "text/plain", "hostname too long"); return; }
+    for (size_t k = 0; k < host.length(); ++k) {
+        char c = host[k];
+        if (!(isalnum((unsigned char)c) || c == '-')) { g_http.send(400, "text/plain", "hostname: letters, digits, '-' only"); return; }
+    }
     Preferences p; p.begin("gs", false);
-    if (g_http.arg("ssid").length()) { p.putString("ssid", g_http.arg("ssid")); p.putString("pass", g_http.arg("pass")); changed = true; }
-    if (hp.length()) { p.putString("hpass", hp); changed = true; }
-    if (xt.length()) { p.putString("xtok", xt); changed = true; }
+    for (int k = 0; k < kNets; ++k) {
+        String ks = "s" + String(k), kw = "w" + String(k);
+        if (!g_http.hasArg(ks)) continue;
+        String ns = g_http.arg(ks), nw = g_http.arg(kw);
+        if (!ns.length()) { p.remove(ks.c_str()); p.remove(kw.c_str()); continue; }
+        p.putString(ks.c_str(), ns);
+        if (nw.length()) p.putString(kw.c_str(), nw);
+        else if (ns != g_ssid[k]) p.putString(kw.c_str(), "");      // новая сеть без пароля = открытая
+    }
+    p.remove("ssid"); p.remove("pass");                              // прежний формат (одна сеть) вытеснен
+    if (host.length()) p.putString("host", host);
+    if (hp.length()) p.putString("hpass", hp);
+    if (ap.length()) p.putString("appass", ap);
+    if (xt.length()) p.putString("xtok", xt);
     p.end();
-    g_http.send(changed ? 200 : 400, "text/plain", changed ? "saved, rebooting" : "nothing changed");
-    if (changed) { delay(500); ESP.restart(); }
+    g_http.send(200, "text/plain", "saved, rebooting");
+    delay(500); ESP.restart();
 }
 
 // Удержание BOOT (GPIO0) ~3 с при включении стирает пароль администратора, Wi-Fi и токен.
@@ -355,7 +403,9 @@ static void factory_reset_if_requested() {
     if (digitalRead(0) != LOW) return;
     uint32_t t0 = millis();
     while (digitalRead(0) == LOW) { if (millis() - t0 > 3000) {
-        Preferences p; p.begin("gs", false); p.remove("hpass"); p.remove("ssid"); p.remove("pass"); p.remove("xtok"); p.remove("appass"); p.end();
+        Preferences p; p.begin("gs", false); p.remove("hpass"); p.remove("ssid"); p.remove("pass"); p.remove("xtok"); p.remove("appass");
+        for (int k = 0; k < kNets; ++k) { p.remove(("s" + String(k)).c_str()); p.remove(("w" + String(k)).c_str()); }
+        p.end();
         Serial.println("factory reset of access settings done");
         return; } delay(10); }
 }
@@ -365,10 +415,7 @@ static void start_ap() {
     String name = "gs-setup-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX);
     Preferences p; p.begin("gs", false);
     String pw = p.getString("appass", "");
-    if (pw.length() < 8) {       // нет пароля AP (из сборки или ранее созданного): случайные 96 бит
-        char b[40]; snprintf(b, sizeof b, "%08lx%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random(), (unsigned long)esp_random());
-        pw = b; p.putString("appass", pw);
-    }
+    if (pw.length() < 8) pw = String("gs-") + kRev;          // пока не задан свой: "gs-<ревизия сборки>"
     p.end();
     WiFi.mode(WIFI_AP_STA);       // STA продолжает пытаться подключиться
     WiFi.softAP(name.c_str(), pw.c_str());
@@ -376,52 +423,77 @@ static void start_ap() {
     Serial.printf("AP mode: ssid=%s pass=%s ip=%s\n", name.c_str(), pw.c_str(), WiFi.softAPIP().toString().c_str());
 }
 
-// Первичная настройка «из сборки»: после OTA поверх чужой прошивки в NVS пусто, а пароль AP
-// случайный и виден только в Serial. Поэтому значения из локального (не в git) platformio_local.ini
-// -DGS_SEED_SSID/-DGS_SEED_PASS/-DGS_SEED_ADMIN/-DGS_SEED_AP_PASS записываются один раз ("seeded").
-static void seed_from_build() {
-#if defined(GS_SEED_SSID) || defined(GS_SEED_ADMIN) || defined(GS_SEED_AP_PASS)
-    Preferences p; p.begin("gs", false);
-    if (!p.getBool("seeded", false)) {
-#ifdef GS_SEED_SSID
-        p.putString("ssid", GS_SEED_SSID);
-#ifdef GS_SEED_PASS
-        p.putString("pass", GS_SEED_PASS);
-#endif
-#endif
-#ifdef GS_SEED_ADMIN
-        if (strlen(GS_SEED_ADMIN) >= 8) p.putString("hpass", GS_SEED_ADMIN);
-#endif
-#ifdef GS_SEED_AP_PASS
-        if (strlen(GS_SEED_AP_PASS) >= 8) p.putString("appass", GS_SEED_AP_PASS);
-#endif
-        p.putBool("seeded", true);
+static int n_nets() { int n = 0; for (int k = 0; k < kNets; ++k) if (g_ssid[k].length()) ++n; return n; }
+
+static void begin_net(int k) {
+    g_net_cur = k;
+    g_wifi_try_ms = millis();
+    WiFi.disconnect(false, false);
+    WiFi.begin(g_ssid[k].c_str(), g_wpass[k].c_str());
+    Serial.printf("wifi: try #%d '%s'\n", k + 1, g_ssid[k].c_str());
+}
+
+static void next_net() {            // следующая настроенная сеть по кругу
+    for (int step = 1; step <= kNets; ++step) {
+        int k = (g_net_cur + step + kNets) % kNets;
+        if (g_ssid[k].length()) { begin_net(k); return; }
     }
-    p.end();
-#endif
 }
 
 static void connect_sta() {
     Preferences p; p.begin("gs", true);
-    String ssid = p.getString("ssid", ""), pass = p.getString("pass", "");
+    for (int k = 0; k < kNets; ++k) { g_ssid[k] = p.getString(("s" + String(k)).c_str(), ""); g_wpass[k] = p.getString(("w" + String(k)).c_str(), ""); }
+    if (!g_ssid[0].length()) { g_ssid[0] = p.getString("ssid", ""); g_wpass[0] = p.getString("pass", ""); }   // прежний формат
     String host = p.getString("host", "grid-supervisor");
     g_http_pass = p.getString("hpass", "");
     g_xtok = p.getString("xtok", "");
     p.end();
+    g_boot_ms = millis();
     WiFi.persistent(false);
-    if (!ssid.length()) { start_ap(); return; }
+    Serial.printf("gs rev %s\n", kRev);
+    if (!n_nets()) { start_ap(); return; }
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(host.c_str());
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    g_wifi_try_ms = millis();
+    WiFi.setAutoReconnect(false);   // переподключением и сменой сети управляет wifi_tick()
+    g_net_cur = -1; next_net();
+}
+
+// Управление Wi-Fi: основная сеть, при недоступности — резервные по кругу (15 с на попытку);
+// на резервной сети раз в 5 мин ищем более приоритетную (асинхронный скан).
+static void wifi_tick() {
+    const bool conn = WiFi.status() == WL_CONNECTED;
+    if (conn) {
+        g_ever_connected = true; g_was_conn = true;
+        if (g_ap_mode) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); g_ap_mode = false; }
+        if (g_net_cur > 0) {
+            if (g_scan_pending) {
+                int n = WiFi.scanComplete();
+                if (n >= 0) {
+                    int best = -1;
+                    for (int k = 0; k < g_net_cur && best < 0; ++k)
+                        for (int i = 0; i < n; ++i) if (g_ssid[k].length() && WiFi.SSID(i) == g_ssid[k]) { best = k; break; }
+                    WiFi.scanDelete(); g_scan_pending = false;
+                    if (best >= 0) begin_net(best);
+                } else if (n == WIFI_SCAN_FAILED) { g_scan_pending = false; }
+            } else if (millis() - g_scan_ms > 300000) {
+                g_scan_ms = millis(); WiFi.scanNetworks(true); g_scan_pending = true;
+            }
+        }
+        return;
+    }
+    g_scan_pending = false;
+    if (n_nets() && millis() - g_wifi_try_ms > 15000) {
+        if (g_was_conn) { g_was_conn = false; begin_net(g_net_cur); }   // только что потеряли — сначала та же сеть
+        else next_net();
+    }
+    // AP — только если Wi-Fi ни разу не подключался с загрузки: короткий обрыв в AP не уводит.
+    if (!g_ever_connected && !g_ap_mode && millis() - g_boot_ms > 120000) start_ap();
 }
 
 void begin(uint32_t boot_id) {
     g_boot_id = boot_id;
     g_mtx = xSemaphoreCreateMutex();
     factory_reset_if_requested();
-    seed_from_build();
     g_cfg = load_config();
     { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); p.end(); }
     connect_sta();
@@ -446,14 +518,7 @@ void begin(uint32_t boot_id) {
 void loop() {
     g_hb_ms.store(now_ms());
     g_http.handleClient();
-    // AP поднимаем только если с начала загрузки Wi-Fi ни разу не подключался (потом — никогда:
-    // иначе короткий обрыв/деаутентификация загоняли бы устройство в AP).
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!g_ever_connected) { g_ever_connected = true; }
-        if (g_ap_mode) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); g_ap_mode = false; }
-    } else if (!g_ever_connected && !g_ap_mode && millis() - g_wifi_try_ms > 120000) {
-        start_ap();
-    }
+    wifi_tick();
     // OTA-образ считается рабочим только при признаках здоровья: ядро сделало >= 10 циклов
     // (шина опрашивается) и прошло >= 2 минут. На платах без rollback в загрузчике вызов безвреден.
     if (!g_ota_validated && now_ms() > 120000 && g_publishes.load() >= 10) {
