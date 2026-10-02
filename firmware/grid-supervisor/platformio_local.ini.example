@@ -1,0 +1,10 @@
+; Скопируйте в platformio_local.ini (в .gitignore) и заполните. Значения попадают в прошивку,
+; поэтому НЕ коммитьте этот файл и не публикуйте собранный .bin.
+; Применяются один раз при первой загрузке с пустым NVS (чистая прошивка поверх BatteryEmulator).
+[env:lilygo_330]
+build_flags =
+    -DCORE_DEBUG_LEVEL=1
+    -DGS_SEED_SSID=\"MyWifi\"
+    -DGS_SEED_PASS=\"wifi-password\"
+    -DGS_SEED_ADMIN=\"admin-password-min-8\"
+    -DGS_SEED_AP_PASS=\"setup-ap-password-min-8\"

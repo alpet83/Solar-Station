@@ -365,7 +365,7 @@ static void start_ap() {
     String name = "gs-setup-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX);
     Preferences p; p.begin("gs", false);
     String pw = p.getString("appass", "");
-    if (pw.length() < 24) {      // 24 hex = 96 бит
+    if (pw.length() < 8) {       // нет пароля AP (из сборки или ранее созданного): случайные 96 бит
         char b[40]; snprintf(b, sizeof b, "%08lx%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random(), (unsigned long)esp_random());
         pw = b; p.putString("appass", pw);
     }
@@ -374,6 +374,31 @@ static void start_ap() {
     WiFi.softAP(name.c_str(), pw.c_str());
     g_ap_mode = true;
     Serial.printf("AP mode: ssid=%s pass=%s ip=%s\n", name.c_str(), pw.c_str(), WiFi.softAPIP().toString().c_str());
+}
+
+// Первичная настройка «из сборки»: после OTA поверх чужой прошивки в NVS пусто, а пароль AP
+// случайный и виден только в Serial. Поэтому значения из локального (не в git) platformio_local.ini
+// -DGS_SEED_SSID/-DGS_SEED_PASS/-DGS_SEED_ADMIN/-DGS_SEED_AP_PASS записываются один раз ("seeded").
+static void seed_from_build() {
+#if defined(GS_SEED_SSID) || defined(GS_SEED_ADMIN) || defined(GS_SEED_AP_PASS)
+    Preferences p; p.begin("gs", false);
+    if (!p.getBool("seeded", false)) {
+#ifdef GS_SEED_SSID
+        p.putString("ssid", GS_SEED_SSID);
+#ifdef GS_SEED_PASS
+        p.putString("pass", GS_SEED_PASS);
+#endif
+#endif
+#ifdef GS_SEED_ADMIN
+        if (strlen(GS_SEED_ADMIN) >= 8) p.putString("hpass", GS_SEED_ADMIN);
+#endif
+#ifdef GS_SEED_AP_PASS
+        if (strlen(GS_SEED_AP_PASS) >= 8) p.putString("appass", GS_SEED_AP_PASS);
+#endif
+        p.putBool("seeded", true);
+    }
+    p.end();
+#endif
 }
 
 static void connect_sta() {
@@ -396,6 +421,7 @@ void begin(uint32_t boot_id) {
     g_boot_id = boot_id;
     g_mtx = xSemaphoreCreateMutex();
     factory_reset_if_requested();
+    seed_from_build();
     g_cfg = load_config();
     { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); p.end(); }
     connect_sta();
