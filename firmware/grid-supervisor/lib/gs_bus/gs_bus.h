@@ -102,6 +102,8 @@ public:
     Gate may_transmit(uint64_t now_ms, uint32_t need_ms) const;
     bool active_window(uint64_t now_ms) const;     // можно опрашивать чаще обычного
 
+    // Задать ожидаемый период пачек (30..900 с); сбрасывает захват. false — значение вне диапазона.
+    bool set_period(uint32_t ms);
     bool locked() const { return locked_; }
     uint32_t period_ms() const { return (uint32_t)period_; }
     uint32_t bursts_total() const { return total_; }

@@ -272,6 +272,7 @@ static void gs_task(void*) {
         const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
         if (now_ms > kStableBootMs) { rtc_short_boots = 0; g_safe_mode = false; }   // стабильно проработали — выходим из safe-mode
 
+        { uint32_t lp; if (shell::take_logger_period(lp)) g_trk.set_period(lp * 1000u); }
         gs::Config nc;
         if (shell::take_config(nc)) g_sv.set_config(nc);
         { int mc = shell::take_manual(); if (mc >= 0 && !shell::sniff_only()) g_sv.manual_request(mc ? gs::Cmd::Connect : gs::Cmd::Disconnect, now_ms); }
@@ -371,6 +372,7 @@ void setup() {
     static const struct { uint16_t a, c; } own[] = {{25201, 79}, {15201, 22}, {20101, 44}, {20000, 16}, {10001, 8}, {10101, 23}};
     for (auto& o : own) g_trk.ignore(0x03, o.a, o.c);
     shell::set_sniff_provider(sniff_provider);
+    g_trk.set_period(shell::logger_period_s() * 1000u);
 
     esp_task_wdt_config_t wdt = {.timeout_ms = kWdtSeconds * 1000, .idle_core_mask = 0, .trigger_panic = true};
     if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);

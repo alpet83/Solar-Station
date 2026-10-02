@@ -133,8 +133,22 @@ static void test_endless_and_reref() {
     }
 }
 
+static void test_set_period() {
+    LoggerTracker tr;
+    CHECK(!tr.set_period(1000) && !tr.set_period(2000000) && tr.set_period(180000));
+    FrameRec f; f.kind = FrameKind::Request; f.id = 4; f.fn = 3; f.addr = 20001; f.count = 16; f.crc_ok = true;
+    const uint64_t base = 50000; const uint32_t jit[] = {0, 4000, 1500, 6000, 0};
+    for (int i = 0; i < 5; ++i) { for (int j = 0; j < 3; ++j) tr.observe(f, base + i * 180000ull + jit[i] + j * 700); tr.tick(base + i * 180000ull + 20000); }
+    CHECK(tr.locked() && tr.period_ms() > 170000 && tr.period_ms() < 190000);
+    // дополнительная «половинная» пачка не ломает захват
+    for (int j = 0; j < 2; ++j) tr.observe(f, base + 5 * 180000ull + 90000 + j * 700);
+    tr.tick(base + 5 * 180000ull + 120000);
+    CHECK(tr.locked() && tr.off_rhythm() >= 1);
+    Gate g = tr.may_transmit(base + 5 * 180000ull + 90500, 100); CHECK(!g.ok);   // но гейтит
+}
+
 int main() {
-    test_classify(); test_sniffer(); test_tracker(); test_tracker_misc(); test_endless_and_reref();
+    test_classify(); test_sniffer(); test_tracker(); test_tracker_misc(); test_endless_and_reref(); test_set_period();
     printf("bus: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

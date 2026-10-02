@@ -26,6 +26,8 @@ static std::atomic<int> g_manual{-1};
 static std::atomic<bool> g_sniff_only{false};
 static std::atomic<int64_t> g_api_at_ms{-1};
 static std::atomic<bool> g_mqtt_bad{false};
+static std::atomic<uint32_t> g_lg_period_s{180};
+static std::atomic<bool> g_lg_dirty{false};
 static shell::SniffProvider g_sniff_prov = nullptr;
 static std::atomic<uint64_t> g_hb_ms{0};
 static std::atomic<uint32_t> g_publishes{0};
@@ -103,6 +105,8 @@ Link link_state() { return WiFi.status() == WL_CONNECTED ? Link::Connected : (g_
 uint64_t api_age_ms() { int64_t a = g_api_at_ms.load(); int64_t n = (int64_t)(esp_timer_get_time() / 1000); return a < 0 ? UINT64_MAX : (uint64_t)(n - a); }
 void set_mqtt_ok(bool ok) { g_mqtt_bad.store(!ok); }
 bool mqtt_bad() { return g_mqtt_bad.load(); }
+uint32_t logger_period_s() { return g_lg_period_s.load(); }
+bool take_logger_period(uint32_t& v) { if (!g_lg_dirty.exchange(false)) return false; v = g_lg_period_s.load(); return true; }
 bool sniff_only() { return g_sniff_only.load(); }
 void set_sniff_provider(SniffProvider p) { g_sniff_prov = p; }
 int take_manual() { return g_manual.exchange(-1); }
@@ -243,6 +247,16 @@ static void h_sniff() {
     g_http.sendHeader("Cache-Control", "no-store");
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
     free(buf);
+}
+
+// POST /api/logger  period_s=30..900 — ожидаемый период пачек даталоггера (сбрасывает захват ритма).
+static void h_logger() {
+    if (!authed(true)) return;
+    long v = g_http.arg("period_s").toInt();
+    if (v < 30 || v > 900) { g_http.send(400, "text/plain", "period_s must be 30..900"); return; }
+    Preferences p; p.begin("gs", false); p.putUInt("lgp", (uint32_t)v); p.end();
+    g_lg_period_s.store((uint32_t)v); g_lg_dirty.store(true);
+    g_http.send(200, "text/plain", "ok");
 }
 
 // POST /api/mode  m=sniff|normal — режим только приёма (управление сетью выключено, на шину не
@@ -509,7 +523,7 @@ void begin(uint32_t boot_id) {
     g_mtx = xSemaphoreCreateMutex();
     factory_reset_if_requested();
     g_cfg = load_config();
-    { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); p.end(); }
+    { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); { uint32_t v = p.getUInt("lgp", 180); g_lg_period_s.store(v >= 30 && v <= 900 ? v : 180); g_lg_dirty.store(true); } p.end(); }
     connect_sta();
     configTime(0, 0, "pool.ntp.org", "time.google.com");     // всё время — UTC
     const char* hdr[] = {"X-GS", "X-GS-Token", "Authorization"};
@@ -523,6 +537,7 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/cmd", HTTP_POST, h_cmd);
     g_http.on("/api/sniff", HTTP_GET, h_sniff);
     g_http.on("/api/mode", HTTP_POST, h_mode);
+    g_http.on("/api/logger", HTTP_POST, h_logger);
     g_http.on("/setup", HTTP_ANY, h_setup);
     g_http.on("/update", HTTP_GET, h_update_form);
     g_http.on("/update", HTTP_POST, h_update_done, h_update_upload);

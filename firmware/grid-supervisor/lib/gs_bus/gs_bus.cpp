@@ -153,6 +153,14 @@ bool LoggerTracker::next_start(uint64_t now, uint64_t& t) const {
     return true;
 }
 
+bool LoggerTracker::set_period(uint32_t ms) {
+    if (ms < 30000 || ms > 900000) return false;
+    cfg_.period_ms = ms; period_ = ms;
+    cfg_.period_tol_ms = ms / 10 < 5000 ? 5000 : (ms / 10 > 20000 ? 20000 : ms / 10);
+    have_ref_ = false; locked_ = false; inphase_ = 0; miss_ = 0;
+    return true;
+}
+
 void LoggerTracker::tick(uint64_t now) {
     if (open_ && now >= cur_last_ && now - cur_last_ > cfg_.burst_gap_ms) close_burst();
     if (!locked_ || !have_ref_ || now <= ref_) return;

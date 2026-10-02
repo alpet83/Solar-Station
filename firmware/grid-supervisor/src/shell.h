@@ -31,6 +31,8 @@ bool ota_active();                             // идёт загрузка об
 uint64_t heartbeat_age_ms();                   // сколько оболочка не вызывала loop()
 void mark_healthy(uint32_t publishes);         // ядро сообщает число успешных циклов (критерий валидности OTA-образа)
 
+uint32_t logger_period_s();                    // ожидаемый период пачек логгера, с (NVS, по умолчанию 180)
+bool take_logger_period(uint32_t& s);          // true, если период изменили (однократно)
 bool sniff_only();                             // режим «только приём» (в NVS, переживает перезагрузку)
 // Провайдер JSON для /api/sniff: копирует готовый текст в буфер, возвращает длину (0 — нет данных).
 typedef size_t (*SniffProvider)(char* out, size_t cap);
