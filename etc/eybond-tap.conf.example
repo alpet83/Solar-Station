@@ -18,8 +18,11 @@
   "stale_s": 1200,
   "offline_s": 1800,
   "host": null,
-  "handler": "builtin:regevent",
-  "telebot_file": "/etc/telebot",
+  "handler": "builtin:webhook",
+  "alert_webhook_url": "http://alerts.example.lan/reg_event.php?tag=${event_tag}&host=${host_name}&value=${event_value}&event=${event_message}",
+  "alert_webhook_method": "GET",
+  "alert_webhook_error_text": "#ERROR",
+  "alert_webhook_timeout_s": 10,
   "handler_args": null,
 
   "tracker": true,

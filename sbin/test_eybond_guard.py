@@ -166,10 +166,10 @@ class HandlerTest(unittest.IsolatedAsyncioTestCase):
                 f.write("def h(tag, text, value, flags, cfg):\n    return 'ok:%s:%s' % (tag, cfg['handler_args'])\n")
             fn, desc = tap.load_handler(p + ':h')
             self.assertEqual(fn('X', 't', 1.0, 0, {'handler_args': 'a'}), 'ok:X:a')
-        fn, _ = tap.load_handler('builtin:regevent')
-        self.assertIs(fn, tap.regevent_handler)
+        fn, _ = tap.load_handler('builtin:webhook')
+        self.assertIs(fn, tap.webhook_handler)
         fn, _ = tap.load_handler(None)
-        self.assertIs(fn, tap.regevent_handler)
+        self.assertIs(fn, tap.webhook_handler)
         fn, _ = tap.load_handler('os.path:basename')
         self.assertEqual(fn('/a/b'), 'b')
         with self.assertRaises(Exception):
@@ -195,35 +195,68 @@ class HandlerTest(unittest.IsolatedAsyncioTestCase):
         await r.deliver('INFO', 'z', 0.0, 0)
         self.assertIn('GUARD-DRYRUN tag=INFO text=z', log.fh.getvalue())
 
-    def test_regevent_error_marker(self):
+    def _server(self, seen):
         import http.server
         import threading
-        seen = {}
 
         class H(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
+            def _do(self):
+                seen['method'] = self.command
                 seen['path'] = self.path
-                seen['body'] = self.rfile.read(int(self.headers['Content-Length']))
-                out = seen.get('resp', b'OK')
-                self.send_response(200)
+                n = int(self.headers.get('Content-Length') or 0)
+                seen['body'] = self.rfile.read(n) if n else b''
+                seen['ctype'] = self.headers.get('Content-Type')
+                self.send_response(seen.get('status', 200))
                 self.end_headers()
-                self.wfile.write(out)
+                self.wfile.write(seen.get('resp', b'OK'))
+            do_GET = do_POST = _do
 
             def log_message(self, *a):
                 pass
         srv = http.server.HTTPServer(('127.0.0.1', 0), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        with tempfile.NamedTemporaryFile('w', suffix='.tb', delete=False) as f:
-            f.write('http://127.0.0.1:%d/bot/\nignored\n' % srv.server_port)
-        cfg = dict(tap.GUARD_DEFAULTS, host='hh', telebot_file=f.name)
-        self.assertEqual(tap.regevent_handler('WARN', 'привет', 50.5, 0, cfg), 'OK')
-        self.assertTrue(seen['path'].startswith('/bot/reg_event.php?tag=WARN&host=hh&value=50.5&flags=0'))
-        self.assertEqual(seen['body'], b'event=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82')
+        return srv
+
+    def test_webhook_get_placeholders(self):
+        seen = {}
+        srv = self._server(seen)
+        url = 'http://127.0.0.1:%d/bot/reg_event.php?tag=${event_tag}&host=${host_name}&value=${event_value}&event=${event_message}&t=SECRET' % srv.server_port
+        cfg = dict(tap.GUARD_DEFAULTS, host='h h', alert_webhook_url=url)
+        res = tap.webhook_handler('WARN', 'привет & мир', 50.5, 0, cfg)
+        self.assertEqual(seen['method'], 'GET')
+        self.assertTrue(seen['path'].startswith('/bot/reg_event.php?tag=WARN&host=h%20h&value=50.5&event=%D0%BF'))
+        self.assertIn('%26', seen['path'])                       # '&' в тексте закодирован
+        self.assertIn('&t=SECRET', seen['path'])
+        self.assertNotIn('SECRET', res)                          # токен в результат/лог не попадает
+        self.assertNotIn('?', res.split('->')[0])
+        srv.shutdown()
+
+    def test_webhook_post_body_error_text_and_status(self):
+        seen = {}
+        srv = self._server(seen)
+        cfg = dict(tap.GUARD_DEFAULTS, host='hh', alert_webhook_method='POST',
+                   alert_webhook_url='http://127.0.0.1:%d/x' % srv.server_port,
+                   alert_webhook_body='event=${event_message}&v=${event_value}',
+                   alert_webhook_error_text='#ERROR')
+        self.assertIn('POST', tap.webhook_handler('ALERT', 'a b', 48.5, 0, cfg))
+        self.assertEqual(seen['body'], b'event=a%20b&v=48.5')
+        self.assertEqual(seen['ctype'], 'application/x-www-form-urlencoded')
         seen['resp'] = b'#ERROR bad'
         with self.assertRaises(RuntimeError):
-            tap.regevent_handler('WARN', 'x', 1, 0, cfg)
+            tap.webhook_handler('WARN', 'x', 1, 0, cfg)
+        seen['resp'] = b'OK'; seen['status'] = 500
+        with self.assertRaises(RuntimeError):
+            tap.webhook_handler('WARN', 'x', 1, 0, cfg)
         srv.shutdown()
-        os.unlink(f.name)
+
+    def test_webhook_not_configured(self):
+        with self.assertRaises(ValueError):
+            tap.webhook_handler('WARN', 'x', 1, 0, dict(tap.GUARD_DEFAULTS))
+
+    def test_render_template(self):
+        self.assertEqual(tap.render_template('a=${event_tag}&b=${host_name}', {'event_tag': 'X Y', 'host_name': 'h'}), 'a=X%20Y&b=h')
+        with self.assertRaises(ValueError):
+            tap.render_template('${nope}', {})
 
 
 class E2ETest(unittest.IsolatedAsyncioTestCase):

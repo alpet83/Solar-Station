@@ -43,14 +43,26 @@ eybond_tap.py - прозрачный TCP-прокси ("tap") для датал�
   stale_s=1200            при живом соединении стика нет замеров АКБ столько секунд -> WARN 'no battery data'
   offline_s=1800          стик ни разу не подключён столько секунд (после первого подключения) -> WARN 'stick offline'
   host                    имя хоста в событии (по умолчанию /etc/hostname, иначе 'tap')
-  handler                 "builtin:regevent" (по умолчанию) | "/path/to/file.py:func" | "module.name:func"
+  handler                 "builtin:webhook" (по умолчанию) | "/path/to/file.py:func" | "module.name:func"
                           сигнатура: func(tag, text, value, flags, cfg) -> str; при сбое бросать исключение;
                           cfg - весь словарь конфига (плагин может читать свои ключи, напр. "handler_args")
-  telebot_file            файл, первая строка которого - базовый URL (по умолчанию /etc/telebot), для regevent
-Встроенный regevent повторяет send_event из sbin/batmon.php: POST (x-www-form-urlencoded, event=<text>)
-на {base}/reg_event.php?tag=..&host=..&value=..&flags=.. , таймаут 10 с, '#ERROR' в ответе = сбой.
-ДОПУЩЕНИЕ: исходный PHP-хелпер curl_http_request в репозитории отсутствует, формат запроса выведен
-из описания; при расхождении подставьте свой обработчик через ключ "handler".
+  alert_webhook_url       URL уведомления для встроенного обработчика (любой http/https-сервис: Telegram-бот,
+                          Home Assistant, ntfy, свой reg_event.php и т.п.). Плейсхолдеры подставляются в URL
+                          с URL-кодированием значений:
+                            ${host_name}      имя хоста (ключ host)
+                            ${event_message}  текст события
+                            ${event_value}    числовое значение (напряжение, В)
+                            ${event_tag}      ALERT | WARN | INFO
+                            ${event_flags}    флаги (целое, сейчас 0)
+                            ${event_time}     время события UTC, YYYY-MM-DDTHH:MM:SSZ
+                          пример: http://srv/reg_event.php?tag=${event_tag}&host=${host_name}&value=${event_value}&event=${event_message}
+  alert_webhook_method    "GET" (по умолчанию) | "POST"
+  alert_webhook_body      только для POST: шаблон тела (те же плейсхолдеры, значения URL-кодируются)
+  alert_webhook_content_type  заголовок Content-Type для POST (по умолчанию application/x-www-form-urlencoded)
+  alert_webhook_error_text    если ответ содержит эту подстроку (напр. "#ERROR") - считать сбоем (по умолчанию не задано);
+                          HTTP-статус >= 400 и сетевые ошибки - сбой всегда
+  alert_webhook_timeout_s таймаут запроса, с (10)
+Секреты в URL (токены) в лог не попадают: пишется только схема://хост/путь без параметров.
 В логе: 'GUARD sample ...' (не чаще раза в 60 с - сверить декодирование с реальностью),
 'GUARD notify tag=.. text=.. -> result', 'GUARD loaded handler ...', 'GUARD-ERROR ...'.
 
@@ -74,8 +86,8 @@ eybond_tap.py - прозрачный TCP-прокси ("tap") для датал�
   consecutive 2               замеров подряд ниже порога для уведомления, целое >= 1
   cooldown_warn_s 3600  cooldown_alert_s 900  stale_s 1200  offline_s 1800   секунды (см. выше)
   host null                   имя хоста в событии (null - /etc/hostname)
-  handler "builtin:regevent"  обработчик уведомлений (см. выше)
-  telebot_file "/etc/telebot" файл с базовым URL для regevent
+  handler "builtin:webhook"   обработчик уведомлений (см. выше)
+  alert_webhook_url null  alert_webhook_method "GET"  alert_webhook_body null  alert_webhook_content_type  alert_webhook_error_text  alert_webhook_timeout_s 10
   handler_args null           произвольное значение для плагина (cfg['handler_args'])
   tracker true                трекер ритма опроса (см. ниже); работает и при guard=false
   cycle_gap_s 10              пауза между запросами, закрывающая цикл опроса, с, > 0
@@ -108,9 +120,11 @@ import itertools
 import json
 import math
 import os
+import re
 import statistics
 import collections
 import urllib.parse
+import urllib.error
 import urllib.request
 import struct
 import time
@@ -326,8 +340,13 @@ GUARD_V_MIN, GUARD_V_MAX = 20.0, 70.0   # фильтр правдоподоби�
 GUARD_DEFAULTS = {
     'enabled': True, 'warn_v': 51.5, 'alert_v': 49.0, 'clear_v': 52.5, 'consecutive': 2,
     'cooldown_warn_s': 3600, 'cooldown_alert_s': 900, 'stale_s': 1200, 'offline_s': 1800,
-    'host': None, 'handler': 'builtin:regevent', 'telebot_file': '/etc/telebot',
+    'host': None, 'handler': 'builtin:webhook',
+    'alert_webhook_url': None, 'alert_webhook_method': 'GET', 'alert_webhook_body': None,
+    'alert_webhook_content_type': 'application/x-www-form-urlencoded', 'alert_webhook_error_text': None,
+    'alert_webhook_timeout_s': 10,
 }
+WEBHOOK_PLACEHOLDERS = ('host_name', 'event_message', 'event_value', 'event_tag', 'event_flags', 'event_time')
+_PH_RE = re.compile(r'\$\{([A-Za-z0-9_]*)\}')
 
 
 def modbus_crc(data):
@@ -746,7 +765,8 @@ CONFIG_DEFAULTS = dict(GUARD_DEFAULTS, **{
     'handler_args': None, 'tracker': True, 'cycle_gap_s': 10.0, 'state_file': None,
 })
 # ключи, принимающие null (= не задано)
-CONFIG_NULLABLE = {'upstream', 'log', 'host', 'handler_args', 'state_file'}
+CONFIG_NULLABLE = {'upstream', 'log', 'host', 'handler_args', 'state_file', 'alert_webhook_url', 'alert_webhook_body',
+                   'alert_webhook_error_text'}
 # 'enabled' - прежнее имя ключа 'guard' (guard имеет приоритет)
 CONFIG_KNOWN = set(CONFIG_DEFAULTS) | {'enabled'}
 
@@ -797,9 +817,24 @@ def validate_config(user):
             if not isinstance(v, str) or not v:
                 raise ConfigError('dns: ожидается строка "HOST" или "HOST:PORT", получено %r' % (v,))
             v = _hostport(k, v, 0) if ':' in v else (v, 53)
-        elif k in ('log', 'host', 'handler', 'telebot_file', 'state_file'):
+        elif k in ('log', 'host', 'handler', 'state_file', 'alert_webhook_content_type', 'alert_webhook_error_text'):
             if not isinstance(v, str) or not v:
                 raise ConfigError('%s: ожидается непустая строка, получено %r' % (k, v))
+        elif k in ('alert_webhook_url', 'alert_webhook_body'):
+            if not isinstance(v, str) or not v:
+                raise ConfigError('%s: ожидается непустая строка, получено %r' % (k, v))
+            if k == 'alert_webhook_url' and not re.match(r'^https?://[^\s/]+', v):
+                raise ConfigError('alert_webhook_url: ожидается http:// или https:// URL, получено %r' % (v,))
+            bad = sorted({n for n in _PH_RE.findall(v) if n not in WEBHOOK_PLACEHOLDERS})
+            if bad:
+                raise ConfigError('%s: неизвестные плейсхолдеры %s; допустимы: %s' % (
+                    k, ', '.join('${%s}' % n for n in bad), ', '.join('${%s}' % n for n in WEBHOOK_PLACEHOLDERS)))
+        elif k == 'alert_webhook_method':
+            if not isinstance(v, str) or v.upper() not in ('GET', 'POST'):
+                raise ConfigError('alert_webhook_method: ожидается "GET" или "POST", получено %r' % (v,))
+            v = v.upper()
+        elif k == 'alert_webhook_timeout_s':
+            v = _num(k, v, 0, 120, strict_lo=True)
         elif k in ('heuristic', 'guard', 'enabled', 'guard_dry_run', 'tracker'):
             if not isinstance(v, bool):
                 raise ConfigError('%s: ожидается true/false, получено %r' % (k, v))
@@ -833,6 +868,9 @@ def load_config_file(path):
         raise ConfigError('не удалось прочитать файл: %s' % (e.strerror or e))
     except ValueError as e:
         raise ConfigError('некорректный JSON: %s' % e)
+    if isinstance(user, dict) and 'alert_webook_url' in user and 'alert_webhook_url' not in user:
+        user = dict(user)
+        user['alert_webhook_url'] = user.pop('alert_webook_url')       # частая опечатка в имени ключа
     cfg, unknown = validate_config(user)
     return cfg, unknown, len(user)
 
@@ -885,36 +923,68 @@ def resolve_settings(parser, argv):
     return args
 
 
-def regevent_handler(tag, text, value, flags, cfg):
-    """Встроенный обработчик, повторяет send_event из sbin/batmon.php.
-    ДОПУЩЕНИЕ: исходный PHP-хелпер curl_http_request отсутствует в репозитории; считаем, что он
-    делает POST application/x-www-form-urlencoded с полем event на {base}/reg_event.php?...
-    Для иного поведения задайте свой "handler" в конфиге."""
-    with open(cfg.get('telebot_file') or '/etc/telebot', encoding='utf-8') as f:
-        base = f.readline().strip().rstrip('/')
-    if not base:
-        raise ValueError('telebot_file: empty base URL')
-    q = urllib.parse.urlencode({'tag': tag, 'host': guard_host(cfg), 'value': value, 'flags': flags})
-    body = urllib.parse.urlencode({'event': text}).encode('utf-8')
-    req = urllib.request.Request('%s/reg_event.php?%s' % (base, q), data=body, method='POST',
-                                 headers={'Content-Type': 'application/x-www-form-urlencoded'})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        resp = r.read().decode('utf-8', 'replace')
-    if '#ERROR' in resp:
-        raise RuntimeError('reg_event: %s' % resp.strip()[:200])
-    return resp.strip()[:200]
+def render_template(tpl, values):
+    """Подставляет ${имя} из values с URL-кодированием значений; неизвестное имя -> ValueError."""
+    def sub(m):
+        name = m.group(1)
+        if name not in values:
+            raise ValueError('unknown placeholder ${%s}' % name)
+        return urllib.parse.quote(str(values[name]), safe='')
+    return _PH_RE.sub(sub, tpl)
+
+
+def _fmt_value(v):
+    try:
+        return ('%.3f' % float(v)).rstrip('0').rstrip('.')
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def safe_url_for_log(url):
+    """схема://хост/путь без параметров запроса (в них могут быть токены)."""
+    p = urllib.parse.urlsplit(url)
+    return '%s://%s%s' % (p.scheme, p.netloc.rpartition('@')[2], p.path)
+
+
+def webhook_handler(tag, text, value, flags, cfg):
+    """Встроенный обработчик: HTTP-запрос на alert_webhook_url с подстановкой плейсхолдеров."""
+    tpl = cfg.get('alert_webhook_url')
+    if not tpl:
+        raise ValueError('alert_webhook_url is not set')
+    values = {'host_name': guard_host(cfg), 'event_message': text, 'event_value': _fmt_value(value),
+              'event_tag': tag, 'event_flags': flags,
+              'event_time': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
+    url = render_template(tpl, values)
+    method = (cfg.get('alert_webhook_method') or 'GET').upper()
+    data, headers = None, {}
+    if method == 'POST':
+        body_tpl = cfg.get('alert_webhook_body') or ''
+        data = render_template(body_tpl, values).encode('utf-8')
+        headers['Content-Type'] = cfg.get('alert_webhook_content_type') or 'application/x-www-form-urlencoded'
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=float(cfg.get('alert_webhook_timeout_s') or 10)) as r:
+            resp = r.read(65536).decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        raise RuntimeError('webhook %s %s: HTTP %s' % (method, safe_url_for_log(url), e.code))
+    except urllib.error.URLError as e:
+        raise RuntimeError('webhook %s %s: %s' % (method, safe_url_for_log(url), e.reason))
+    marker = cfg.get('alert_webhook_error_text')
+    if marker and marker in resp:
+        raise RuntimeError('webhook %s: response contains %r: %s' % (safe_url_for_log(url), marker, resp.strip()[:200]))
+    return ('%s %s -> %s' % (method, safe_url_for_log(url), resp.strip()[:120])).strip()
 
 
 def load_handler(spec):
-    """'builtin:regevent' | '/path/file.py:func' | 'module.name:func' -> (callable, описание)."""
-    spec = spec or 'builtin:regevent'
+    """'builtin:webhook' | '/path/file.py:func' | 'module.name:func' -> (callable, описание)."""
+    spec = spec or 'builtin:webhook'
     where, sep, name = spec.rpartition(':')
     if not sep or not where or not name:
         raise ValueError('handler must be "<file.py|module>:<func>", got %r' % spec)
     if where == 'builtin':
-        if name != 'regevent':
+        if name != 'webhook':
             raise ValueError('unknown builtin handler %r' % name)
-        return regevent_handler, spec
+        return webhook_handler, spec
     if where.endswith('.py') or os.sep in where or '/' in where:
         sp = importlib.util.spec_from_file_location('eybond_guard_handler_%x' % (hash(where) & 0xffff), where)
         if sp is None or sp.loader is None:

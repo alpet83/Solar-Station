@@ -131,6 +131,11 @@ class ConfigTest(unittest.TestCase):
             ({'guard': 1}, 'guard'),
             ({'stale_s': True}, 'stale_s'),
             ({'handler': 7}, 'handler'),
+            ({'alert_webhook_url': 'ftp://x/y'}, 'alert_webhook_url'),
+            ({'alert_webhook_url': 'http://h/?a=${bogus}'}, 'bogus'),
+            ({'alert_webhook_method': 'PUT'}, 'alert_webhook_method'),
+            ({'alert_webhook_body': 'x=${nope}'}, 'nope'),
+            ({'alert_webhook_timeout_s': 0}, 'alert_webhook_timeout_s'),
             ([1, 2], 'JSON'),
             ('{broken', 'JSON'),
         ]
@@ -144,6 +149,14 @@ class ConfigTest(unittest.TestCase):
         code, err = resolve_fail(['--config', os.path.join(self.d, 'nope.json')])
         self.assertEqual(code, 2)
         self.assertIn('nope.json', err)
+
+    def test_webhook_keys_and_typo_alias(self):
+        url = 'http://h/e?m=${event_message}&v=${event_value}&h=${host_name}&t=${event_tag}&f=${event_flags}&ts=${event_time}'
+        p = write_cfg(self.d, {'upstream': '1.2.3.4:5', 'alert_webook_url': url, 'alert_webhook_method': 'post'})
+        args = resolve(['--config', p])
+        self.assertEqual(args.settings['alert_webhook_url'], url)          # опечатка webook принимается
+        self.assertEqual(args.settings['alert_webhook_method'], 'POST')
+        self.assertFalse([m for m in args.config_msgs if 'unknown' in m])
 
     def test_main_missing_upstream(self):
         r = subprocess.run([sys.executable, TAP_PY, '--listen', '127.0.0.1:0'], capture_output=True, text=True, timeout=20)
