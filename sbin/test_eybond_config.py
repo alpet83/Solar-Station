@@ -168,6 +168,7 @@ class ConfigTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn('Traceback', r.stderr)
 
+    @unittest.skipIf(sys.platform == 'win32', 'корректное завершение по SIGINT проверяется только на POSIX')
     def test_main_runs_from_config_only(self):
         logp = os.path.join(self.d, 'tap.log')
         p = write_cfg(self.d, {'listen': '127.0.0.1:0', 'upstream': '127.0.0.1:9', 'log': logp, 'foo': 1,
