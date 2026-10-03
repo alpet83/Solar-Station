@@ -11,7 +11,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/solar-station/sbin/eybond_tap.py --listen 0.0.0.0:502 --upstream ess.eybond.com:502 --dns 8.8.8.8 --log /var/log/eybond-tap.log
+# battery guard необязателен: уберите --guard-config, чтобы выключить; конфиг - etc/eybond-tap.conf.example
+# (если файла нет, guard пишет GUARD-ERROR в лог и проксирование работает как обычно)
+ExecStart=/usr/bin/python3 /opt/solar-station/sbin/eybond_tap.py --listen 0.0.0.0:502 --upstream ess.eybond.com:502 --dns 8.8.8.8 --log /var/log/eybond-tap.log --guard-config /etc/eybond-tap.conf
 Restart=on-failure
 RestartSec=5
 # порт <1024 требует привилегий; вместо root можно выдать capability

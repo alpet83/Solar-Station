@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "warn_v": 51.5,
+  "alert_v": 49.0,
+  "clear_v": 52.5,
+  "consecutive": 2,
+  "cooldown_warn_s": 3600,
+  "cooldown_alert_s": 900,
+  "stale_s": 1200,
+  "offline_s": 1800,
+  "handler": "builtin:regevent",
+  "telebot_file": "/etc/telebot"
+}
