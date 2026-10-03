@@ -317,9 +317,15 @@ class TrackerTest(unittest.TestCase):
                 self.assertIn(k, st)
             self.assertFalse([f for f in os.listdir(d) if f != 'state.json'])   # tmp не остаётся
             # ошибка записи не ломает ничего
+            # отсутствующие каталоги создаются автоматически
             r.state_file = os.path.join(d, 'no', 'such', 'dir', 's.json')
             r.tracker.request(T[0] + 100, 20001, 16)
             r._cycle_closed(r.tracker.tick(T[0] + 200))
+            self.assertTrue(os.path.exists(r.state_file))
+            # а реальная ошибка записи (родитель - файл) не ломает ничего
+            r.state_file = os.path.join(d, 'state.json', 'x.json')
+            r.tracker.request(T[0] + 300, 20001, 16)
+            r._cycle_closed(r.tracker.tick(T[0] + 400))
             self.assertIn('TRACKER-ERROR state_file', log.fh.getvalue())
 
     def test_tracker_exception_contained(self):
@@ -384,6 +390,18 @@ class TrackerE2E(unittest.IsolatedAsyncioTestCase):
         os.unlink(sf)
         self.assertEqual(len(cloud_rx), sum(len(answer(a, c)) for a, c in seq))   # проксирование не затронуто
         self.assertEqual(len(stick_rx), 4 * (len(hdr) + 8))
+
+
+class EnsureDirTests(unittest.TestCase):
+    def test_state_file_and_log_dirs_created(self):
+        import tempfile, os, eybond_tap
+        with tempfile.TemporaryDirectory() as d:
+            sf = os.path.join(d, 'a', 'b', 'cycle.json')
+            eybond_tap.write_state_file(sf, {'x': 1})
+            self.assertTrue(os.path.exists(sf))
+            lg = eybond_tap.Log(os.path.join(d, 'c', 'tap.log'))
+            lg.line('hi')
+            self.assertTrue(os.path.exists(os.path.join(d, 'c', 'tap.log')))
 
 
 if __name__ == '__main__':

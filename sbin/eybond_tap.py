@@ -242,7 +242,7 @@ def fmt_ts(dt):
 
 class Log:
     def __init__(self, path):
-        self.fh = open(path, 'a', encoding='utf-8') if path else sys.stdout
+        self.fh = (ensure_parent_dir(path) or open(path, 'a', encoding='utf-8')) if path else sys.stdout
 
     def line(self, msg):
         try:
@@ -726,8 +726,16 @@ class CycleTracker:
         }
 
 
+def ensure_parent_dir(path):
+    """Создаёт каталог файла, если его нет (повторные вызовы дёшевы)."""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
 def write_state_file(path, state):
     """Атомарная запись JSON (tmp + rename)."""
+    ensure_parent_dir(path)
     tmp = '%s.tmp%d' % (path, os.getpid())
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(state, f, ensure_ascii=False)
