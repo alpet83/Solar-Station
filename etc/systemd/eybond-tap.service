@@ -11,7 +11,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/solar-station/sbin/eybond_tap.py --listen 0.0.0.0:502 --upstream 8.218.126.236:502 --log /var/log/eybond-tap.log
+ExecStart=/usr/bin/python3 /opt/solar-station/sbin/eybond_tap.py --listen 0.0.0.0:502 --upstream ess.eybond.com:502 --dns 8.8.8.8 --log /var/log/eybond-tap.log
 Restart=on-failure
 RestartSec=5
 # порт <1024 требует привилегий; вместо root можно выдать capability

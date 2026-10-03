@@ -16,12 +16,16 @@ eybond_tap.py - прозрачный TCP-прокси ("tap") для датал�
 
 Пример:
   eybond_tap.py --listen 0.0.0.0:502 --upstream 8.218.126.236:502 --log tap.log
-(порт 502 здесь - предположение, реальный порт уточняется; меняется в --listen/--upstream)
+(порт 502 подтверждён захватом: стик шлёт SYN на :502; --upstream принимает и имя: ess.eybond.com:502 --dns 8.8.8.8)
 """
 import argparse
 import asyncio
 import datetime
+import ipaddress
 import itertools
+import os
+import struct
+import time
 import signal
 import socket
 import sys
@@ -29,6 +33,101 @@ import sys
 CHUNK = 65536          # размер одного чтения
 CONNECT_TIMEOUT = 15.0  # таймаут подключения к upstream, с
 WRITE_BUF_HIGH = 256 * 1024  # high-water для буфера записи (backpressure через drain)
+
+
+# --- резолв имени upstream напрямую у внешнего DNS (минимальный клиент A-записей, только stdlib) ---
+# Нужен, когда локальный DNS подменяет имя облака на адрес этого хоста: общий резолвер дал бы петлю.
+def _dns_query(name, server, port=53, timeout=3.0):
+    """Возвращает (список IPv4-строк, ttl). Бросает OSError/ValueError."""
+    qid = struct.unpack('>H', os.urandom(2))[0]
+    q = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
+    for lab in name.rstrip('.').split('.'):
+        b = lab.encode('ascii')
+        if not 0 < len(b) < 64:
+            raise ValueError('bad name %r' % name)
+        q += bytes([len(b)]) + b
+    q += b'\x00' + struct.pack('>HH', 1, 1)
+    last = None
+    for _ in range(2):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(q, (server, port))
+            data, addr = sock.recvfrom(1500)
+        except OSError as e:
+            last = e
+            continue
+        finally:
+            sock.close()
+        if addr[0] != server or len(data) < 12 or struct.unpack('>H', data[:2])[0] != qid:
+            last = ValueError('unexpected DNS reply')
+            continue
+        flags, qd, an = struct.unpack('>HHH', data[2:8])
+        if flags & 0x8000 == 0 or (flags & 0xF) != 0:
+            raise ValueError('DNS rcode %d' % (flags & 0xF))
+        pos = 12
+
+        def skip_name(i):
+            while True:
+                if i >= len(data):
+                    raise ValueError('truncated')
+                n = data[i]
+                if n == 0:
+                    return i + 1
+                if n & 0xC0 == 0xC0:
+                    return i + 2
+                i += 1 + n
+        for _q in range(qd):
+            pos = skip_name(pos) + 4
+        ips, ttl = [], None
+        for _a in range(an):
+            pos = skip_name(pos)
+            if pos + 10 > len(data):
+                raise ValueError('truncated')
+            rtype, _cls, rttl, rdlen = struct.unpack('>HHIH', data[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append('.'.join(str(x) for x in data[pos:pos + 4]))
+                ttl = rttl if ttl is None else min(ttl, rttl)
+            pos += rdlen
+        if not ips:
+            raise ValueError('no A records for %s' % name)
+        return ips, ttl
+    raise last or OSError('DNS timeout')
+
+
+class Upstream:
+    """Адрес облака: IP-литерал как есть, имя - через --dns (кэш по TTL, при сбое прежний адрес)."""
+
+    def __init__(self, host, port, dns_server='8.8.8.8', dns_port=53):
+        self.host, self.port, self.dns_server, self.dns_port = host, port, dns_server, dns_port
+        try:
+            ipaddress.ip_address(host)
+            self.literal = True
+        except ValueError:
+            self.literal = False
+        self.ip, self.expires = (host if self.literal else None), 0.0
+
+    async def get(self, log=None):
+        if self.literal or (self.ip and time.monotonic() < self.expires):
+            return self.ip
+        try:
+            ips, ttl = await asyncio.get_event_loop().run_in_executor(
+                None, _dns_query, self.host, self.dns_server, self.dns_port)
+            ip = ips[0]
+            if ipaddress.ip_address(ip).is_private or ipaddress.ip_address(ip).is_loopback:
+                raise ValueError('resolved to private address %s (DNS override?)' % ip)
+            self.ip, self.expires = ip, time.monotonic() + min(max(ttl or 60, 30), 300)
+            if log:
+                log.line('RESOLVE %s -> %s via %s (ttl=%s)' % (self.host, ip, self.dns_server, ttl))
+        except (OSError, ValueError) as e:
+            if log:
+                log.line('RESOLVE-FAIL %s via %s: %r%s' % (self.host, self.dns_server, e,
+                                                          ' (using last %s)' % self.ip if self.ip else ''))
+            if not self.ip:
+                raise OSError('cannot resolve %s' % self.host)
+            self.expires = time.monotonic() + 30
+        return self.ip
 
 
 def utc_now():
@@ -162,8 +261,10 @@ async def handle(creader, cwriter, args, log, ids, tasks):
     peer = cwriter.get_extra_info('peername')
     log.line('#%d CONNECT stick=%s:%s' % (cid, peer[0], peer[1]) if peer else '#%d CONNECT stick=?' % cid)
     set_keepalive(cwriter)
-    uhost, uport = args.upstream
+    uphost, uport = args.upstream.host, args.upstream.port
+    uhost = uphost
     try:
+        uhost = await args.upstream.get(log)
         ureader, uwriter = await asyncio.wait_for(
             asyncio.open_connection(uhost, uport), CONNECT_TIMEOUT)
     except (OSError, asyncio.TimeoutError) as e:
@@ -234,7 +335,7 @@ async def run(args, log, stop_evt=None, ready=None):
     lhost, lport = args.listen
     server = await asyncio.start_server(cb, lhost, lport, limit=CHUNK)
     addrs = [s.getsockname() for s in server.sockets]
-    log.line('LISTEN %s upstream=%s:%d burst_gap=%s' % (addrs, args.upstream[0], args.upstream[1], args.burst_gap))
+    log.line('LISTEN %s upstream=%s:%d burst_gap=%s' % (addrs, args.upstream.host, args.upstream.port, args.burst_gap))
     if ready is not None:
         ready(server.sockets[0].getsockname()[1])
     stop_evt = stop_evt or asyncio.Event()
@@ -260,7 +361,10 @@ def build_parser():
     p.add_argument('--listen', default='0.0.0.0:502', type=lambda s: parse_hostport(s, '--listen', 0),
                    help='куда слушать, HOST:PORT (по умолчанию 0.0.0.0:502; порт уточняется)')
     p.add_argument('--upstream', required=True, type=lambda s: parse_hostport(s, '--upstream'),
-                   help='настоящий сервер IP:PORT, напр. 8.218.126.236:502 (имя не резолвится)')
+                   help='настоящий сервер HOST:PORT: IP (8.218.126.236:502) или имя (ess.eybond.com:502) - '
+                        'имя резолвится напрямую через --dns, минуя локальный резолвер')
+    p.add_argument('--dns', default='8.8.8.8', type=lambda s: parse_hostport(s, '--dns', 0) if ':' in s else (s, 53),
+                   help='DNS-сервер для имени upstream, HOST[:PORT] (по умолчанию 8.8.8.8)')
     p.add_argument('--log', default=None, help='файл лога (по умолчанию stdout)')
     p.add_argument('--max-hex', type=int, default=64, help='байт payload в hex на чанк (64)')
     p.add_argument('--burst-gap', type=float, default=3.0, help='пауза S->C, начинающая новый burst, с (3.0)')
@@ -271,6 +375,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.upstream = Upstream(args.upstream[0], args.upstream[1], args.dns[0], args.dns[1])
     log = Log(args.log)
     try:
         asyncio.run(run(args, log))

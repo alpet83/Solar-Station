@@ -17,9 +17,11 @@ class MemLog(tap.Log):
 
 
 def mkargs(upstream_port, gap=0.2):
-    return tap.build_parser().parse_args(
+    a = tap.build_parser().parse_args(
         ['--listen', '127.0.0.1:0', '--upstream', '127.0.0.1:%d' % upstream_port,
          '--burst-gap', str(gap)])
+    a.upstream = tap.Upstream(a.upstream[0], a.upstream[1], a.dns[0], a.dns[1])
+    return a
 
 
 async def start_tap(args, log):
@@ -81,6 +83,53 @@ class TapTest(unittest.IsolatedAsyncioTestCase):
         stop.set()
         await task
         self.assertIn('UPSTREAM-FAIL', log.fh.getvalue())
+
+
+class FakeDns(asyncio.DatagramProtocol):
+    def __init__(self, ip, rcode=0):
+        self.ip, self.rcode, self.n = ip, rcode, 0
+
+    def connection_made(self, tr):
+        self.tr = tr
+
+    def datagram_received(self, data, addr):
+        import struct
+        self.n += 1
+        qid = data[:2]
+        end = data.index(b'\x00', 12) + 5
+        q = data[12:end]
+        hdr = qid + struct.pack('>HHHHH', 0x8180 | self.rcode, 1, 0 if self.rcode else 1, 0, 0)
+        ans = b'' if self.rcode else b'\xc0\x0c' + struct.pack('>HHIH', 1, 1, 120, 4) + bytes(int(x) for x in self.ip.split('.'))
+        self.tr.sendto(hdr + q + ans, addr)
+
+
+class DnsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolve_and_cache(self):
+        loop = asyncio.get_running_loop()
+        tr, proto = await loop.create_datagram_endpoint(lambda: FakeDns('8.218.126.236'), local_addr=('127.0.0.1', 0))
+        port = tr.get_extra_info('sockname')[1]
+        up = tap.Upstream('ess.eybond.com', 502, '127.0.0.1', port)
+        log = MemLog()
+        self.assertEqual(await up.get(log), '8.218.126.236')
+        self.assertEqual(await up.get(log), '8.218.126.236')   # из кэша
+        self.assertEqual(proto.n, 1)
+        self.assertIn('RESOLVE ess.eybond.com -> 8.218.126.236', log.fh.getvalue())
+        tr.close()
+
+    async def test_private_answer_rejected_and_last_ip_kept(self):
+        loop = asyncio.get_running_loop()
+        tr, proto = await loop.create_datagram_endpoint(lambda: FakeDns('192.168.16.13'), local_addr=('127.0.0.1', 0))
+        port = tr.get_extra_info('sockname')[1]
+        up = tap.Upstream('ess.eybond.com', 502, '127.0.0.1', port)
+        with self.assertRaises(OSError):                      # подмена на частный адрес = петля: отказ
+            await up.get(MemLog())
+        up.ip = '8.218.126.236'                               # известный прежний адрес используется при сбое
+        self.assertEqual(await up.get(MemLog()), '8.218.126.236')
+        tr.close()
+
+    async def test_literal_ip_not_resolved(self):
+        up = tap.Upstream('8.218.126.236', 502)
+        self.assertEqual(await up.get(), '8.218.126.236')
 
 
 if __name__ == '__main__':
