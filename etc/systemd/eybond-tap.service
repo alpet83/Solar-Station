@@ -3,7 +3,7 @@
 #   sudo cp eybond-tap.service /etc/systemd/system/ && sudo systemctl daemon-reload
 #   sudo systemctl start eybond-tap     # разово, для захвата трафика
 #   sudo systemctl enable eybond-tap    # только если нужен постоянный запуск
-# Поправьте пути, порты и --upstream под свою установку.
+# Поправьте пути под свою установку; порты и upstream - в /etc/eybond-tap.conf.
 [Unit]
 Description=Eybond datalogger transparent TCP tap
 After=network-online.target
@@ -11,14 +11,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# battery guard необязателен: уберите --guard-config, чтобы выключить; конфиг - etc/eybond-tap.conf.example
-# (если файла нет, guard пишет GUARD-ERROR в лог и проксирование работает как обычно)
-ExecStart=/usr/bin/python3 /opt/solar-station/sbin/eybond_tap.py --listen 0.0.0.0:502 --upstream ess.eybond.com:502 --dns 8.8.8.8 --log /var/log/eybond-tap.log --guard-config /etc/eybond-tap.conf
+# все параметры (listen/upstream/dns/log, battery guard, трекер ритма опроса) - в JSON-конфиге,
+# см. etc/eybond-tap.conf.example; "guard": false выключает guard. Нет файла или ошибка в нём -> сервис не стартует
+# (причина в journalctl). Флаги командной строки при необходимости перекрывают конфиг.
+ExecStart=/usr/bin/python3 /opt/solar-station/sbin/eybond_tap.py --config /etc/eybond-tap.conf
 Restart=on-failure
 RestartSec=5
 # порт <1024 требует привилегий; вместо root можно выдать capability
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 DynamicUser=yes
+RuntimeDirectory=eybond-tap
 NoNewPrivileges=yes
 ProtectSystem=strict
 # DynamicUser: лог в /var/log недоступен на запись без User= и прав на файл; при проблемах задайте User=/LogsDirectory=

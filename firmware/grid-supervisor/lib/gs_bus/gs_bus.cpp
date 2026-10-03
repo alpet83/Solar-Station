@@ -156,7 +156,7 @@ bool LoggerTracker::next_start(uint64_t now, uint64_t& t) const {
 bool LoggerTracker::set_period(uint32_t ms) {
     if (ms < 30000 || ms > 900000) return false;
     cfg_.period_ms = ms; period_ = ms;
-    cfg_.period_tol_ms = ms / 10 < 5000 ? 5000 : (ms / 10 > 20000 ? 20000 : ms / 10);
+    cfg_.period_tol_ms = ms / 8 < 5000 ? 5000 : (ms / 8 > 20000 ? 20000 : ms / 8);
     have_ref_ = false; locked_ = false; inphase_ = 0; miss_ = 0;
     return true;
 }

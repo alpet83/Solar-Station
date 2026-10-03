@@ -1,5 +1,14 @@
 {
-  "enabled": true,
+  "listen": "0.0.0.0:502",
+  "upstream": "ess.eybond.com:502",
+  "dns": "8.8.8.8",
+  "log": "/var/log/eybond-tap.log",
+  "max_hex": 64,
+  "burst_gap": 3.0,
+  "heuristic": false,
+
+  "guard": true,
+  "guard_dry_run": false,
   "warn_v": 51.5,
   "alert_v": 49.0,
   "clear_v": 52.5,
@@ -8,6 +17,12 @@
   "cooldown_alert_s": 900,
   "stale_s": 1200,
   "offline_s": 1800,
+  "host": null,
   "handler": "builtin:regevent",
-  "telebot_file": "/etc/telebot"
+  "telebot_file": "/etc/telebot",
+  "handler_args": null,
+
+  "tracker": true,
+  "cycle_gap_s": 10,
+  "state_file": "/run/eybond-tap/cycle.json"
 }

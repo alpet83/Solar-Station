@@ -30,10 +30,11 @@ eybond_tap.py - прозрачный TCP-прокси ("tap") для датал�
 20..70 В считается мусором. Guard ничего не отправляет в стик/облако и никогда не влияет на
 проксирование: все его вызовы обёрнуты в try/except, обработчик уведомлений работает в потоке.
 
-Включение: --guard-config /etc/eybond-tap.conf (без ключа guard выключен).
+Включение: --config /etc/eybond-tap.conf (guard включён по умолчанию, когда конфиг задан;
+"guard": false выключает; без конфига guard выключен). --guard-config - устаревший синоним --config.
   --guard-dry-run     только логировать 'GUARD-DRYRUN tag=.. text=..', обработчик не вызывать
   --guard-test TAG    отправить одно тестовое событие через обработчик и выйти
-Конфиг - JSON, все ключи необязательны (см. etc/eybond-tap.conf.example):
+Ключи guard в конфиге (все необязательны, см. etc/eybond-tap.conf.example):
   enabled=true  warn_v=51.5  alert_v=49.0  clear_v=52.5  (В; WARN при <=warn_v, ALERT при <=alert_v,
                 INFO 'battery recovered' при >=clear_v после любого отправленного низкого состояния)
   consecutive=2           сколько подряд замеров ниже порога нужно для уведомления
@@ -52,6 +53,49 @@ eybond_tap.py - прозрачный TCP-прокси ("tap") для датал�
 из описания; при расхождении подставьте свой обработчик через ключ "handler".
 В логе: 'GUARD sample ...' (не чаще раза в 60 с - сверить декодирование с реальностью),
 'GUARD notify tag=.. text=.. -> result', 'GUARD loaded handler ...', 'GUARD-ERROR ...'.
+
+=== ПОЛНЫЙ КОНФИГ-ФАЙЛ: --config PATH (JSON) ===
+Все параметры можно задать в файле, командная строка не нужна. Приоритет:
+явный флаг CLI > конфиг-файл > встроенное умолчание. Неизвестные ключи -> 'CONFIG unknown key: ..'
+(предупреждение, не ошибка; ключи сохраняются для плагинов-обработчиков). Ошибки типов/диапазонов,
+битый JSON, отсутствие файла -> понятное сообщение и код выхода != 0 (без traceback).
+В начале работы в лог пишется 'CONFIG loaded <path> (N keys)'. Значение null = "не задано".
+Ключи (умолчание в скобках):
+  listen "0.0.0.0:502"        куда слушать HOST:PORT                              (флаг --listen)
+  upstream null               настоящий сервер HOST:PORT, IP или имя; обязателен: в конфиге или --upstream
+  dns "8.8.8.8"               DNS для имени upstream, "HOST" или "HOST:PORT"      (флаг --dns)
+  log null                    файл лога (null - stdout)                           (флаг --log)
+  max_hex 64                  байт payload в hex на чанк, >= 0                    (флаг --max-hex)
+  burst_gap 3.0               пауза S->C, начинающая новый BURST, с, > 0          (флаг --burst-gap)
+  heuristic false             эвристический разбор первых 8 байт                  (флаг --heuristic)
+  guard true                  включить battery guard (false - выключить; синоним старого "enabled")
+  guard_dry_run false         guard: не вызывать обработчик, только лог           (флаг --guard-dry-run)
+  warn_v 51.5  alert_v 49.0  clear_v 52.5   пороги, В; требуется alert_v < warn_v < clear_v
+  consecutive 2               замеров подряд ниже порога для уведомления, целое >= 1
+  cooldown_warn_s 3600  cooldown_alert_s 900  stale_s 1200  offline_s 1800   секунды (см. выше)
+  host null                   имя хоста в событии (null - /etc/hostname)
+  handler "builtin:regevent"  обработчик уведомлений (см. выше)
+  telebot_file "/etc/telebot" файл с базовым URL для regevent
+  handler_args null           произвольное значение для плагина (cfg['handler_args'])
+  tracker true                трекер ритма опроса (см. ниже); работает и при guard=false
+  cycle_gap_s 10              пауза между запросами, закрывающая цикл опроса, с, > 0
+  state_file null             путь JSON-файла состояния трекера (запись атомарно tmp+rename)
+
+=== POLL-CYCLE TRACKER: ритм "свежих данных" инвертора ===
+Облако каждые ~90 с (82..97 с) опрашивает инвертор полным циклом: ~10 Modbus-запросов (slave 4)
+с шагом ~0.3 с в течение ~5.5 с, каждый получает ответ стика с живыми данными. Отдельный
+не-Modbus heartbeat (~36 с, 16 Б/26 Б) циклом НЕ считается: трекер питается только запросами/
+ответами, найденными CRC-сканом guard (а не размерами чанков). Цикл = группа запросов с паузами
+< cycle_gap_s; закрывается, когда запросов нет cycle_gap_s. На закрытие пишется строка:
+  CYCLE start=<UTC iso> dur=<с> n_req=<n> blocks=<25201x74,...> fresh=<k>/<n> pack_v=<В|?>
+        since_prev=<с|?> period=<медиана|?> locked=<true|false>
+fresh - сколько запросов цикла получили сопоставленный ответ; pack_v - из блока 25201 цикла;
+period - медиана до 8 последних интервалов между стартами циклов; locked - не менее 3 интервалов
+в пределах +-15% от медианы. Хранятся последние 64 цикла. Если задан state_file, при каждом
+закрытии цикла атомарно пишется JSON: updated_utc, last_start_utc, last_start_epoch, period_s,
+jitter_s (max-min интервалов), locked, next_start_epoch (старт + период), last_pack_v,
+last_sample_age_s, cycles_seen. Ошибки трекера/файла логируются как 'TRACKER-ERROR ...' и
+на проксирование не влияют.
 """
 import argparse
 import asyncio
@@ -62,7 +106,10 @@ import importlib.util
 import ipaddress
 import itertools
 import json
+import math
 import os
+import statistics
+import collections
 import urllib.parse
 import urllib.request
 import struct
@@ -334,7 +381,9 @@ class Guard:
     """Пассивный разбор Modbus во проксируемом трафике + конечный автомат уведомлений.
     Методы возвращают список событий (tag, text, value, flags); ничего не отправляют сами."""
 
-    def __init__(self, cfg=None):
+    def __init__(self, cfg=None, notify=True):
+        self.notify = notify          # False: только декодирование (для трекера), события не выдаются
+        self.observer = None          # объект с on_request(now, addr, cnt) / on_response(now, addr, regs)
         c = dict(GUARD_DEFAULTS)
         c.update(cfg or {})
         self.cfg = c
@@ -388,13 +437,21 @@ class Guard:
             self._scan_requests(now, conn, buf)
         else:
             for regs_start, regs in self._scan_responses(now, conn, buf):
+                self._observe('on_response', now, regs_start, regs)
                 events += self._on_block(now, regs_start, regs)
         if len(buf) > GUARD_BUF:
             del buf[:len(buf) - GUARD_BUF]
-        return events
+        return events if self.notify else []
 
-    @staticmethod
-    def _scan_requests(now, conn, buf):
+    def _observe(self, name, *a):
+        obs = self.observer
+        if obs is not None:
+            try:
+                getattr(obs, name)(*a)
+            except Exception:
+                pass          # наблюдатель не должен мешать разбору
+
+    def _scan_requests(self, now, conn, buf):
         last_end = 0
         s = 0
         while True:
@@ -407,6 +464,7 @@ class Guard:
                 if 1 <= cnt <= 125:
                     conn.reqs.append((now, buf[s + 1], addr, cnt))
                     del conn.reqs[:-GUARD_REQ_KEEP]
+                    self._observe('on_request', now, addr, cnt)
                     s += 8
                     last_end = s
                     continue
@@ -507,7 +565,7 @@ class Guard:
 
     def tick(self, now):
         """Периодические проверки: нет данных / стик offline. Возвращает события."""
-        if not self.enabled:
+        if not self.enabled or not self.notify:
             return []
         try:
             return self._tick(now)
@@ -532,6 +590,132 @@ class Guard:
         return ev
 
 
+# ======================= POLL-CYCLE TRACKER =======================
+# Чистая логика без I/O и asyncio: время передаётся снаружи (now = monotonic), часы инъектируются.
+
+def _iso_utc(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class CycleTracker:
+    """Ритм опроса инвертора облаком. Цикл = группа Modbus-запросов с паузами < gap_s.
+    request()/response()/tick() возвращают словарь закрытого цикла (или None); сам ничего не пишет."""
+
+    KEEP = 64            # сколько последних циклов помнить
+    PERIOD_N = 8         # по скольким последним интервалам считать период
+    LOCK_TOL = 0.15      # допуск "захвата" ритма, доля от медианы
+    LOCK_MIN = 3         # минимум интервалов в допуске для locked
+    PACK_BLOCK = 25201   # блок, из которого берём напряжение АКБ
+
+    def __init__(self, gap_s=10.0, clock=time.monotonic, wall=time.time):
+        self.gap = float(gap_s)
+        self.clock = clock
+        self._off = wall() - clock()      # перевод monotonic -> epoch
+        self.cur = None
+        self.cycles = collections.deque(maxlen=self.KEEP)
+        self.cycles_seen = 0
+        self.last_pack_v = None
+        self.last_pack_t = None
+
+    def epoch(self, now):
+        return self._off + now
+
+    def request(self, now, addr, cnt):
+        closed = None
+        if self.cur is not None and now - self.cur['last_req'] >= self.gap:
+            closed = self._close()
+        if self.cur is None:
+            self.cur = {'start': now, 'start_epoch': self.epoch(now), 'last_req': now, 'last': now,
+                        'blocks': [], 'pack_v': None}
+        c = self.cur
+        c['blocks'].append({'addr': addr, 'cnt': cnt, 'fresh': False})
+        c['last_req'] = c['last'] = now
+        return closed
+
+    def response(self, now, addr, regs):
+        pv = None
+        if addr == self.PACK_BLOCK and len(regs) >= 5:
+            v = regs[4] * 0.1
+            if GUARD_V_MIN <= v <= GUARD_V_MAX:
+                pv = v
+                self.last_pack_v, self.last_pack_t = v, now
+        c = self.cur
+        if c is None:
+            return None
+        for b in reversed(c['blocks']):
+            if not b['fresh'] and b['addr'] == addr and b['cnt'] == len(regs):
+                b['fresh'] = True
+                c['last'] = max(c['last'], now)
+                if pv is not None:
+                    c['pack_v'] = pv
+                break
+        return None
+
+    def tick(self, now):
+        if self.cur is not None and now - self.cur['last_req'] >= self.gap:
+            return self._close()
+        return None
+
+    def _intervals(self):
+        st = [c['start'] for c in self.cycles]
+        return [b - a for a, b in zip(st, st[1:])][-self.PERIOD_N:]
+
+    def stats(self):
+        """(period, jitter, locked) по последним интервалам; period/jitter = None, если интервалов нет."""
+        iv = self._intervals()
+        if not iv:
+            return None, None, False
+        med = statistics.median(iv)
+        ok = sum(1 for x in iv if med > 0 and abs(x - med) <= self.LOCK_TOL * med)
+        return med, max(iv) - min(iv), ok >= self.LOCK_MIN
+
+    def _close(self):
+        c, self.cur = self.cur, None
+        prev = self.cycles[-1]['start'] if self.cycles else None
+        rec = {'start': c['start'], 'start_epoch': c['start_epoch'], 'dur': c['last'] - c['start'],
+               'n_req': len(c['blocks']), 'blocks': [(b['addr'], b['cnt']) for b in c['blocks']],
+               'fresh': sum(1 for b in c['blocks'] if b['fresh']), 'pack_v': c['pack_v'],
+               'since_prev': (c['start'] - prev) if prev is not None else None}
+        self.cycles.append(rec)
+        self.cycles_seen += 1
+        rec['period'], rec['jitter'], rec['locked'] = self.stats()
+        return rec
+
+    @staticmethod
+    def format(rec):
+        return ('CYCLE start=%s dur=%.1f n_req=%d blocks=%s fresh=%d/%d pack_v=%s since_prev=%s period=%s locked=%s'
+                % (_iso_utc(rec['start_epoch']), rec['dur'], rec['n_req'],
+                   ','.join('%dx%d' % b for b in rec['blocks']), rec['fresh'], rec['n_req'],
+                   '%.1f' % rec['pack_v'] if rec['pack_v'] is not None else '?',
+                   '%.1f' % rec['since_prev'] if rec['since_prev'] is not None else '?',
+                   '%.1f' % rec['period'] if rec['period'] is not None else '?',
+                   'true' if rec['locked'] else 'false'))
+
+    def state(self, now):
+        """Содержимое state-файла (dict, готов к json.dump)."""
+        period, jitter, locked = self.stats()
+        last = self.cycles[-1] if self.cycles else None
+        return {
+            'updated_utc': _iso_utc(self.epoch(now)),
+            'last_start_utc': _iso_utc(last['start_epoch']) if last else None,
+            'last_start_epoch': last['start_epoch'] if last else None,
+            'period_s': period, 'jitter_s': jitter, 'locked': locked,
+            'next_start_epoch': (last['start_epoch'] + period) if last and period is not None else None,
+            'last_pack_v': self.last_pack_v,
+            'last_sample_age_s': (now - self.last_pack_t) if self.last_pack_t is not None else None,
+            'cycles_seen': self.cycles_seen,
+        }
+
+
+def write_state_file(path, state):
+    """Атомарная запись JSON (tmp + rename)."""
+    tmp = '%s.tmp%d' % (path, os.getpid())
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
 # --- конфиг и обработчики уведомлений ---
 
 def guard_host(cfg):
@@ -547,16 +731,158 @@ def guard_host(cfg):
     return 'tap'
 
 
-def load_guard_config(path):
-    """JSON-конфиг поверх умолчаний; неизвестные ключи сохраняются (для плагинов). Бросает при ошибке."""
-    with open(path, encoding='utf-8') as f:
-        user = json.load(f)
+class ConfigError(ValueError):
+    """Ошибка конфиг-файла/параметров: сообщение показывается пользователю без traceback."""
+
+
+def parse_dns(s):
+    return parse_hostport(s, 'dns', 0) if ':' in s else (s, 53)
+
+
+# умолчания всех параметров (CLI > файл > эти значения)
+CONFIG_DEFAULTS = dict(GUARD_DEFAULTS, **{
+    'listen': ('0.0.0.0', 502), 'upstream': None, 'dns': ('8.8.8.8', 53), 'log': None,
+    'max_hex': 64, 'burst_gap': 3.0, 'heuristic': False, 'guard': True, 'guard_dry_run': False,
+    'handler_args': None, 'tracker': True, 'cycle_gap_s': 10.0, 'state_file': None,
+})
+# ключи, принимающие null (= не задано)
+CONFIG_NULLABLE = {'upstream', 'log', 'host', 'handler_args', 'state_file'}
+# 'enabled' - прежнее имя ключа 'guard' (guard имеет приоритет)
+CONFIG_KNOWN = set(CONFIG_DEFAULTS) | {'enabled'}
+
+
+def _num(key, v, lo=None, hi=None, strict_lo=False, integer=False):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ConfigError('%s: ожидается %s, получено %r' % (key, 'целое число' if integer else 'число', v))
+    if integer and (not isinstance(v, int)):
+        if float(v) != int(v):
+            raise ConfigError('%s: ожидается целое число, получено %r' % (key, v))
+        v = int(v)
+    if lo is not None and (v <= lo if strict_lo else v < lo):
+        raise ConfigError('%s: должно быть %s %s, получено %r' % (key, '>' if strict_lo else '>=', lo, v))
+    if hi is not None and v > hi:
+        raise ConfigError('%s: должно быть <= %s, получено %r' % (key, hi, v))
+    return v
+
+
+def _hostport(key, v, min_port):
+    if not isinstance(v, str):
+        raise ConfigError('%s: ожидается строка HOST:PORT, получено %r' % (key, v))
+    try:
+        return parse_hostport(v, key, min_port)
+    except argparse.ArgumentTypeError as e:
+        raise ConfigError(str(e))
+
+
+def validate_config(user):
+    """Проверяет dict из JSON. Возвращает (нормализованный dict, список неизвестных ключей).
+    Неизвестные ключи остаются в dict как есть (для плагинов). Бросает ConfigError."""
     if not isinstance(user, dict):
-        raise ValueError('guard config must be a JSON object')
+        raise ConfigError('конфиг должен быть JSON-объектом')
+    out, unknown = {}, []
+    for k, v in user.items():
+        if k not in CONFIG_KNOWN:
+            unknown.append(k)
+            out[k] = v
+            continue
+        if v is None:
+            if k in CONFIG_NULLABLE:
+                continue                       # null = ключ не задан
+            raise ConfigError('%s: null недопустим' % k)
+        if k == 'listen':
+            v = _hostport(k, v, 0)
+        elif k == 'upstream':
+            v = _hostport(k, v, 1)
+        elif k == 'dns':
+            if not isinstance(v, str) or not v:
+                raise ConfigError('dns: ожидается строка "HOST" или "HOST:PORT", получено %r' % (v,))
+            v = _hostport(k, v, 0) if ':' in v else (v, 53)
+        elif k in ('log', 'host', 'handler', 'telebot_file', 'state_file'):
+            if not isinstance(v, str) or not v:
+                raise ConfigError('%s: ожидается непустая строка, получено %r' % (k, v))
+        elif k in ('heuristic', 'guard', 'enabled', 'guard_dry_run', 'tracker'):
+            if not isinstance(v, bool):
+                raise ConfigError('%s: ожидается true/false, получено %r' % (k, v))
+        elif k == 'max_hex':
+            v = _num(k, v, 0, integer=True)
+        elif k == 'consecutive':
+            v = _num(k, v, 1, integer=True)
+        elif k in ('burst_gap', 'cycle_gap_s', 'stale_s', 'offline_s'):
+            v = _num(k, v, 0, strict_lo=True)
+        elif k in ('cooldown_warn_s', 'cooldown_alert_s'):
+            v = _num(k, v, 0)
+        elif k in ('warn_v', 'alert_v', 'clear_v'):
+            v = _num(k, v, 0, 100, strict_lo=True)
+        out[k] = v
+    return out, unknown
+
+
+def check_thresholds(cfg):
+    if not cfg['alert_v'] < cfg['warn_v']:
+        raise ConfigError('warn_v (%s) должен быть больше alert_v (%s)' % (cfg['warn_v'], cfg['alert_v']))
+    if not cfg['warn_v'] < cfg['clear_v']:
+        raise ConfigError('clear_v (%s) должен быть больше warn_v (%s)' % (cfg['clear_v'], cfg['warn_v']))
+
+
+def load_config_file(path):
+    """Читает и проверяет JSON-конфиг -> (dict, неизвестные ключи, число ключей). Бросает ConfigError."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            user = json.load(f)
+    except OSError as e:
+        raise ConfigError('не удалось прочитать файл: %s' % (e.strerror or e))
+    except ValueError as e:
+        raise ConfigError('некорректный JSON: %s' % e)
+    cfg, unknown = validate_config(user)
+    return cfg, unknown, len(user)
+
+
+def load_guard_config(path):
+    """JSON-конфиг поверх умолчаний guard; неизвестные ключи сохраняются (для плагинов). Бросает при ошибке."""
+    user, _unknown, _n = load_config_file(path)
     cfg = dict(GUARD_DEFAULTS)
     cfg.update(user)
+    check_thresholds(cfg)
     cfg['host'] = guard_host(cfg)
     return cfg
+
+
+def resolve_settings(parser, argv):
+    """Разбор CLI + конфиг-файл. Приоритет: явный флаг CLI > файл > умолчание.
+    Возвращает args с заполненными полями и args.settings (полный dict). Ошибки -> parser.error (exit 2)."""
+    args = parser.parse_args(argv)
+    explicit = vars(build_parser(False).parse_args(argv))     # только реально указанные флаги
+    path = args.config or args.guard_config
+    msgs = []
+    if args.config and args.guard_config:
+        msgs.append('CONFIG --guard-config ignored (deprecated, --config given)')
+    elif args.guard_config:
+        msgs.append('CONFIG --guard-config is deprecated, use --config')
+    fcfg, nkeys = {}, 0
+    if path:
+        try:
+            fcfg, unknown, nkeys = load_config_file(path)
+        except ConfigError as e:
+            parser.error('конфиг %s: %s' % (path, e))
+        msgs.append('CONFIG loaded %s (%d keys)' % (path, nkeys))
+        msgs += ['CONFIG unknown key: %s' % k for k in unknown]
+    s = dict(CONFIG_DEFAULTS)
+    s.update(fcfg)
+    s['guard'] = fcfg.get('guard', fcfg.get('enabled', bool(path)))
+    for k in ('listen', 'upstream', 'dns', 'log', 'max_hex', 'burst_gap', 'heuristic'):
+        if explicit.get(k) is not None:        # upstream имеет default=None и попадает в explicit всегда
+            s[k] = explicit[k]
+    if explicit.get('guard_dry_run'):
+        s['guard_dry_run'] = True
+    s['enabled'] = s['guard']
+    try:
+        check_thresholds(s)
+    except ConfigError as e:
+        parser.error('конфиг %s: %s' % (path, e))
+    s['host'] = guard_host(s)
+    args.settings, args.config_msgs, args.config_path = s, msgs, path
+    args.guard_config = path       # совместимость: guard_self_test / run
+    return args
 
 
 def regevent_handler(tag, text, value, flags, cfg):
@@ -611,15 +937,26 @@ class GuardRunner:
     HANDLER_TIMEOUT = 15.0
     SAMPLE_LOG_S = 60.0
 
-    def __init__(self, cfg, log, handler=None, dry_run=False, clock=time.monotonic):
+    def __init__(self, cfg, log, handler=None, dry_run=False, clock=time.monotonic, notify=True, wall=time.time):
         self.cfg, self.log, self.dry_run, self.clock = cfg, log, dry_run, clock
-        self.guard = Guard(cfg)
+        self.notify = notify          # False: guard только декодирует (режим "только трекер")
+        gcfg = dict(cfg)
+        if not notify:
+            gcfg['enabled'] = True
+        self.guard = Guard(gcfg, notify=notify)
+        self.tracker = None
+        self.state_file = cfg.get('state_file')
+        if cfg.get('tracker', False):            # без ключа (старые вызовы) трекер выключен
+            self.tracker = CycleTracker(cfg.get('cycle_gap_s', 10.0), clock, wall)
+            self.guard.observer = self
         self.handler = handler
         self.queue = None
         self.tasks = []
         self.last_logged_seq = 0
         self.last_log_t = None
-        if handler is None and not dry_run:
+        if not notify:
+            pass
+        elif handler is None and not dry_run:
             try:
                 self.handler, desc = load_handler(cfg.get('handler'))
                 log.line('GUARD loaded handler %s' % desc)
@@ -632,12 +969,46 @@ class GuardRunner:
         self.queue = asyncio.Queue(maxsize=50)
         loop = asyncio.get_running_loop()
         self.tasks = [loop.create_task(self._worker()), loop.create_task(self._ticker())]
+        if self.tracker is not None:
+            self.tasks.append(loop.create_task(self._tracker_ticker()))
 
     async def stop(self):
         for t in self.tasks:
             t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks = []
+
+    # --- трекер ритма опроса (ошибки не влияют на проксирование) ---
+    def on_request(self, now, addr, cnt):
+        try:
+            self._cycle_closed(self.tracker.request(now, addr, cnt))
+        except Exception as e:
+            self.log.line('TRACKER-ERROR request: %r' % e)
+
+    def on_response(self, now, addr, regs):
+        try:
+            self.tracker.response(now, addr, regs)
+        except Exception as e:
+            self.log.line('TRACKER-ERROR response: %r' % e)
+
+    def _cycle_closed(self, rec):
+        if rec is None:
+            return
+        self.log.line(CycleTracker.format(rec))
+        if self.state_file:
+            try:
+                write_state_file(self.state_file, self.tracker.state(self.clock()))
+            except Exception as e:
+                self.log.line('TRACKER-ERROR state_file %s: %r' % (self.state_file, e))
+
+    async def _tracker_ticker(self):
+        step = max(0.05, min(1.0, self.tracker.gap / 3))
+        while True:
+            await asyncio.sleep(step)
+            try:
+                self._cycle_closed(self.tracker.tick(self.clock()))
+            except Exception as e:
+                self.log.line('TRACKER-ERROR tick: %r' % e)
 
     def conn_open(self, cid):
         try:
@@ -727,20 +1098,31 @@ def guard_self_test(args, log):
 
 
 def build_guard_runner(args, log):
-    """Создаёт GuardRunner из args.guard_config или None (при отсутствии/ошибке конфига)."""
-    if not args.guard_config:
-        return None
-    try:
-        cfg = load_guard_config(args.guard_config)
-    except Exception as e:
-        log.line('GUARD-ERROR cannot load config %s: %r (guard disabled)' % (args.guard_config, e))
-        return None
-    if not cfg.get('enabled', True):
+    """Создаёт GuardRunner (guard и/или трекер) из args.settings либо None.
+    Без args.settings (программный вызов) - старая схема через args.guard_config."""
+    cfg = getattr(args, 'settings', None)
+    if cfg is None:
+        if not args.guard_config:
+            return None
+        try:
+            cfg = load_guard_config(args.guard_config)
+        except Exception as e:
+            log.line('GUARD-ERROR cannot load config %s: %r (guard disabled)' % (args.guard_config, e))
+            return None
+        cfg['guard'] = cfg.get('enabled', True)
+        cfg['guard_dry_run'] = bool(getattr(args, 'guard_dry_run', False))
+    guard, tracker = bool(cfg.get('guard')), bool(cfg.get('tracker', False))
+    if not guard and not tracker:
         log.line('GUARD disabled by config')
         return None
-    log.line('GUARD enabled warn_v=%s alert_v=%s clear_v=%s consecutive=%s host=%s'
-             % (cfg['warn_v'], cfg['alert_v'], cfg['clear_v'], cfg['consecutive'], cfg['host']))
-    return GuardRunner(cfg, log, dry_run=args.guard_dry_run)
+    if guard:
+        log.line('GUARD enabled warn_v=%s alert_v=%s clear_v=%s consecutive=%s host=%s'
+                 % (cfg['warn_v'], cfg['alert_v'], cfg['clear_v'], cfg['consecutive'], cfg['host']))
+    else:
+        log.line('GUARD disabled by config (tracker only)')
+    if tracker:
+        log.line('TRACKER enabled cycle_gap_s=%s state_file=%s' % (cfg.get('cycle_gap_s'), cfg.get('state_file')))
+    return GuardRunner(cfg, log, dry_run=bool(cfg.get('guard_dry_run')), notify=guard)
 
 
 async def pump(reader, writer, label, cid, args, log, burst):
@@ -857,7 +1239,7 @@ async def run(args, log, stop_evt=None, ready=None):
             conns.discard(t)
 
     guard = getattr(args, 'guard_runner', None)
-    if guard is None and getattr(args, 'guard_config', None):
+    if guard is None and (getattr(args, 'settings', None) or getattr(args, 'guard_config', None)):
         guard = args.guard_runner = build_guard_runner(args, log)
     if guard is not None:
         guard.start()
@@ -887,41 +1269,59 @@ async def run(args, log, stop_evt=None, ready=None):
         await guard.stop()
 
 
-def build_parser():
-    p = argparse.ArgumentParser(description='Прозрачный TCP-tap для Eybond/SmartESS даталоггера.')
-    p.add_argument('--listen', default='0.0.0.0:502', type=lambda s: parse_hostport(s, '--listen', 0),
+def build_parser(full=True):
+    """full=False: у всех опций нет умолчаний (argparse.SUPPRESS) - так определяем, что указано явно."""
+    def d(v):
+        return v if full else argparse.SUPPRESS
+    p = argparse.ArgumentParser(description='Прозрачный TCP-tap для Eybond/SmartESS даталоггера. '
+                                'Все параметры можно задать в --config (JSON); приоритет: флаг CLI > конфиг > умолчание.')
+    p.add_argument('--config', default=None, metavar='PATH',
+                   help='JSON-конфиг со ВСЕМИ параметрами (см. docstring и etc/eybond-tap.conf.example)')
+    p.add_argument('--listen', default=d('0.0.0.0:502'), type=lambda s: parse_hostport(s, '--listen', 0),
                    help='куда слушать, HOST:PORT (по умолчанию 0.0.0.0:502; порт уточняется)')
     p.add_argument('--upstream', default=None, type=lambda s: parse_hostport(s, '--upstream'),
                    help='настоящий сервер HOST:PORT: IP (8.218.126.236:502) или имя (ess.eybond.com:502) - '
-                        'имя резолвится напрямую через --dns, минуя локальный резолвер')
-    p.add_argument('--dns', default='8.8.8.8', type=lambda s: parse_hostport(s, '--dns', 0) if ':' in s else (s, 53),
+                        'имя резолвится напрямую через --dns, минуя локальный резолвер; '
+                        'обязателен, если нет ключа upstream в конфиге')
+    p.add_argument('--dns', default=d('8.8.8.8'), type=parse_dns,
                    help='DNS-сервер для имени upstream, HOST[:PORT] (по умолчанию 8.8.8.8)')
-    p.add_argument('--log', default=None, help='файл лога (по умолчанию stdout)')
-    p.add_argument('--max-hex', type=int, default=64, help='байт payload в hex на чанк (64)')
-    p.add_argument('--burst-gap', type=float, default=3.0, help='пауза S->C, начинающая новый burst, с (3.0)')
-    p.add_argument('--heuristic', action='store_true',
+    p.add_argument('--log', default=d(None), help='файл лога (по умолчанию stdout)')
+    p.add_argument('--max-hex', type=int, default=d(64), help='байт payload в hex на чанк (64)')
+    p.add_argument('--burst-gap', type=float, default=d(3.0), help='пауза S->C, начинающая новый burst, с (3.0)')
+    p.add_argument('--heuristic', action='store_true', default=d(False),
                    help='добавлять эвристический разбор первых 8 байт (непроверенный, только для наблюдения)')
     p.add_argument('--guard-config', default=None, metavar='PATH',
-                   help='JSON-конфиг battery guard (без ключа guard выключен), см. docstring')
-    p.add_argument('--guard-dry-run', action='store_true',
+                   help='УСТАРЕЛО: синоним --config (guard включён)')
+    p.add_argument('--guard-dry-run', action='store_true', default=d(False),
                    help="guard: только логировать 'GUARD-DRYRUN tag=.. text=..', обработчик не вызывать")
     p.add_argument('--guard-test', default=None, metavar='TAG',
-                   help='guard: отправить одно тестовое событие через обработчик из --guard-config и выйти')
+                   help='guard: отправить одно тестовое событие через обработчик из --config и выйти')
     return p
 
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    args = resolve_settings(parser, argv)
+    s = args.settings
     if args.guard_test is not None:
-        if not args.guard_config:
-            parser.error('--guard-test требует --guard-config')
+        if not args.config_path:
+            parser.error('--guard-test требует --config')
         sys.exit(guard_self_test(args, None))
-    if not args.upstream:
-        parser.error('--upstream обязателен')
-    args.upstream = Upstream(args.upstream[0], args.upstream[1], args.dns[0], args.dns[1])
-    log = Log(args.log)
+    if not s['upstream']:
+        parser.error('не задан upstream: укажите --upstream HOST:PORT или ключ "upstream" в конфиге')
+    args.listen, args.dns = s['listen'], s['dns']
+    args.max_hex, args.burst_gap, args.heuristic = s['max_hex'], s['burst_gap'], s['heuristic']
+    args.guard_dry_run = s['guard_dry_run']
+    args.upstream = Upstream(s['upstream'][0], s['upstream'][1], s['dns'][0], s['dns'][1])
     try:
+        log = Log(s['log'])
+    except OSError as e:
+        parser.error('не удалось открыть лог %s: %s' % (s['log'], e.strerror or e))
+    try:
+        for m in args.config_msgs:
+            log.line(m)
         asyncio.run(run(args, log))
     finally:
         log.close()

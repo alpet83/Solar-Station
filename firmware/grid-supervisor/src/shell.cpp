@@ -26,7 +26,7 @@ static std::atomic<int> g_manual{-1};
 static std::atomic<bool> g_sniff_only{false};
 static std::atomic<int64_t> g_api_at_ms{-1};
 static std::atomic<bool> g_mqtt_bad{false};
-static std::atomic<uint32_t> g_lg_period_s{180};
+static std::atomic<uint32_t> g_lg_period_s{90};
 static std::atomic<bool> g_lg_dirty{false};
 static shell::SniffProvider g_sniff_prov = nullptr;
 static std::atomic<uint64_t> g_hb_ms{0};
@@ -523,7 +523,7 @@ void begin(uint32_t boot_id) {
     g_mtx = xSemaphoreCreateMutex();
     factory_reset_if_requested();
     g_cfg = load_config();
-    { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); { uint32_t v = p.getUInt("lgp", 180); g_lg_period_s.store(v >= 30 && v <= 900 ? v : 180); g_lg_dirty.store(true); } p.end(); }
+    { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); { uint32_t v = p.getUInt("lgp", 90); g_lg_period_s.store(v >= 30 && v <= 900 ? v : 90); g_lg_dirty.store(true); } p.end(); }
     connect_sta();
     configTime(0, 0, "pool.ntp.org", "time.google.com");     // всё время — UTC
     const char* hdr[] = {"X-GS", "X-GS-Token", "Authorization"};
