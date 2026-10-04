@@ -316,7 +316,7 @@ static const char kUpdForm[] PROGMEM =
 
 static void h_update_form() { if (authed(false)) g_http.send_P(200, "text/html", kUpdForm); }
 
-static bool g_upd_auth = false, g_upd_ok = false;
+static bool g_upd_auth = false, g_upd_ok = false, g_upd_first = false;
 static String g_upd_err;
 
 static void h_update_done() {
@@ -333,14 +333,15 @@ static void h_update_upload() {
     HTTPUpload& up = g_http.upload();
     if (up.status == UPLOAD_FILE_START) {
         g_upd_auth = basic_ok() && g_http.hasHeader("X-GS");
-        g_upd_ok = false; g_upd_err = "";
+        g_upd_ok = false; g_upd_err = ""; g_upd_first = true;
         if (!g_upd_auth) return;
         g_ota_active = true;
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) upd_fail("begin");
     } else if (!g_upd_auth || !g_ota_active) {
         return;
     } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (up.totalSize == up.currentSize) {            // первый чанк: проверка заголовка образа ESP32
+        if (g_upd_first) {                                // первый чанк (totalSize растёт ПОСЛЕ вызова обработчика — по нему первый чанк не узнать)
+            g_upd_first = false;
             if (up.currentSize < 48 || up.buf[0] != 0xE9) { upd_fail("not an ESP32 image"); return; }
             uint32_t magic; memcpy(&magic, up.buf + 32, 4);   // esp_app_desc_t.magic_word
             if (magic != 0xABCD5432u) { upd_fail("no app descriptor"); return; }
