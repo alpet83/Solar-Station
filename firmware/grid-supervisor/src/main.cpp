@@ -360,6 +360,7 @@ static void led_task(void*) {
 }
 
 void setup() {
+    Serial.setRxBufferSize(1024);     // вставка нескольких строк настроек, пока идёт запись в NVS
     Serial.begin(115200);
     init_boot_counter();
     pinMode(GS_PIN_5V_EN, OUTPUT); digitalWrite(GS_PIN_5V_EN, HIGH);

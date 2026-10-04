@@ -84,6 +84,18 @@ static void test_other() {
     CHECK(is_err(cli_parse("net 1 ssid 12345678 extra extra2", 4)));
 }
 
+static void test_new() {
+    CHECK(cli_parse("scan", 4).kind == CliKind::Scan);
+    CHECK(cli_parse("export", 4).kind == CliKind::Export);
+    CHECK(cli_parse("# comment net 1 x y", 4).kind == CliKind::None);
+    CHECK(cli_parse("   #x", 4).kind == CliKind::None);
+    CHECK(cli_parse("\"#\"", 4).kind == CliKind::Error);                 // кавычками # не комментарий
+    CliCmd c = cli_parse("token 0123456789abcdef", 4);
+    CHECK(c.kind == CliKind::ExtToken && !strcmp(c.a, "0123456789abcdef"));
+    CHECK(is_err(cli_parse("token short", 4)));
+    CHECK(is_err(cli_parse("token", 4)));
+}
+
 static void test_line() {
     CliLine l;
     auto feed_all = [&](const char* s, std::string& out) {
@@ -118,7 +130,7 @@ static void test_sniff_policy() {
 }
 
 int main() {
-    test_simple(); test_net(); test_other(); test_line(); test_sniff_policy();
+    test_simple(); test_net(); test_new(); test_other(); test_line(); test_sniff_policy();
     CHECK(strstr(cli_help_text(), "net <1..4>") != nullptr);
     printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;

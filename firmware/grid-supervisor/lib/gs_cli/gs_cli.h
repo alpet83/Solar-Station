@@ -5,7 +5,7 @@
 
 namespace gs {
 
-enum class CliKind { None, Help, Status, Nets, NetSet, NetDel, Host, ApPass, AdminPass, Mode, Logger, Log, Reboot, Error };
+enum class CliKind { None, Help, Status, Nets, NetSet, NetDel, Host, ApPass, AdminPass, Mode, Logger, Log, Reboot, Scan, Export, ExtToken, Error };
 
 struct CliCmd {
     CliKind kind = CliKind::None;

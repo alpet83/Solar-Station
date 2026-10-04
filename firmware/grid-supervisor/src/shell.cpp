@@ -50,6 +50,7 @@ static uint32_t g_scan_ms = 0, g_boot_ms = 0;
 #endif
 static const char* kRev = GS_REV;
 static bool g_ota_validated = false;
+static volatile uint8_t g_last_reason = 0;     // причина последнего отключения STA (0 = нет / подключено)
 
 static uint64_t now_ms() { return (uint64_t)(esp_timer_get_time() / 1000); }
 
@@ -433,6 +434,7 @@ static void h_setup() {
 static void factory_reset_if_requested() {
     pinMode(0, INPUT_PULLUP);
     if (digitalRead(0) != LOW) return;
+    Serial.println("BOOT is low at start: keeping it low for 3 s = factory reset of access settings");
     uint32_t t0 = millis();
     while (digitalRead(0) == LOW) { if (millis() - t0 > 3000) {
         Preferences p; p.begin("gs", false); p.remove("hpass"); p.remove("ssid"); p.remove("pass"); p.remove("xtok"); p.remove("appass");
@@ -523,6 +525,26 @@ static void wifi_tick() {
 }
 
 
+static void on_sta_event(arduino_event_id_t ev, arduino_event_info_t info) {
+    if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) g_last_reason = info.wifi_sta_disconnected.reason;
+    else if (ev == ARDUINO_EVENT_WIFI_STA_GOT_IP) g_last_reason = 0;
+}
+
+static const char* reason_text(uint8_t r) {
+    switch (r) {
+    case 0: return "";
+    case 2: case 6: case 7: return "auth expired / not authenticated";
+    case 8: return "left by AP";
+    case 15: case 204: return "handshake timeout (wrong password?)";
+    case 200: return "beacon timeout (weak signal)";
+    case 201: return "network not found";
+    case 202: return "authentication failed (wrong password?)";
+    case 203: return "association failed";
+    case 205: return "connection failed";
+    default: return "other";
+    }
+}
+
 // ---- консоль по Serial ------------------------------------------------------------------------
 // Физический доступ к USB = доверенный доступ, поэтому без пароля. Выполняется в задаче оболочки
 // (как и HTTP-обработчики), гонок с массивами сетей нет.
@@ -532,7 +554,10 @@ static String net_status_line(bool with_ap_hint) {
         s = "net: STA up ssid='" + WiFi.SSID() + "' ip=" + WiFi.localIP().toString() + " rssi=" + String(WiFi.RSSI()) +
             " dBm net#" + String(g_net_cur + 1) + "/" + String(n_nets());
     else if (!n_nets()) s = "net: no networks configured (use: net 1 <ssid> <pass>)";
-    else s = "net: STA down, trying #" + String(g_net_cur + 1) + " '" + (g_net_cur >= 0 ? g_ssid[g_net_cur] : String("?")) + "'";
+    else {
+        s = "net: STA down, trying #" + String(g_net_cur + 1) + " '" + (g_net_cur >= 0 ? g_ssid[g_net_cur] : String("?")) + "'";
+        if (g_last_reason) s += " err=" + String((int)g_last_reason) + " (" + reason_text(g_last_reason) + ")";
+    }
     if (g_ap_mode) s += " | AP on ssid=gs-setup-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX) + " ip=" + WiFi.softAPIP().toString();
     else if (with_ap_hint) s += " | AP off";
     return s;
@@ -541,7 +566,7 @@ static String net_status_line(bool with_ap_hint) {
 // Строка статуса: сразу при смене состояния и раз в 30 с — чтобы по консоли всегда было видно, где плата.
 static void net_status_tick() {
     static String last; static uint32_t at = 0;
-    String key = WiFi.status() == WL_CONNECTED ? "up:" + WiFi.SSID() + WiFi.localIP().toString() : String("down:") + g_net_cur + (g_ap_mode ? "ap" : "");
+    String key = WiFi.status() == WL_CONNECTED ? "up:" + WiFi.SSID() + WiFi.localIP().toString() : String("down:") + g_net_cur + ":" + (int)g_last_reason + (g_ap_mode ? "ap" : "");
     if (key != last || millis() - at >= 30000) { last = key; at = millis(); Serial.println(net_status_line(true)); }
 }
 
@@ -607,6 +632,36 @@ static void cli_exec(const gs::CliCmd& c) {
         if (c.flag >= 0) g_serial_log.store(c.flag == 1);
         Serial.printf("log: %s\n", g_serial_log.load() ? "on" : "off");
         break;
+    case CliKind::Scan: {
+        Serial.println("scanning...");
+        int n = WiFi.scanNetworks(false, true);
+        if (n < 0) { Serial.println("error: scan failed (busy connecting?), retry in a few seconds"); break; }
+        for (int i = 0; i < n && i < 25; ++i) {
+            String ss = WiFi.SSID(i);
+            int mine = 0;
+            for (int k = 0; k < kNets; ++k) if (g_ssid[k].length() && ss == g_ssid[k]) mine = k + 1;
+            Serial.printf("%2d. '%s' ch%d %d dBm %s%s\n", i + 1, ss.length() ? ss.c_str() : "(hidden)", (int)WiFi.channel(i), (int)WiFi.RSSI(i),
+                          WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "secured", mine ? (String("  <- net ") + mine).c_str() : "");
+        }
+        Serial.printf("%d networks found (2.4 GHz only)\n", n);
+        WiFi.scanDelete();
+        break; }
+    case CliKind::Export: {
+        auto q = [](const String& v) { String o = "\""; for (size_t i = 0; i < v.length(); ++i) { if (v[i] == '"' || v[i] == '\\') o += '\\'; o += v[i]; } return o + "\""; };
+        Preferences p; p.begin("gs", true);
+        Serial.println("# gs export (contains passwords; paste back or send with tools/gs_send.sh)");
+        for (int k = 0; k < kNets; ++k)
+            if (g_ssid[k].length()) Serial.printf("net %d %s %s\n", k + 1, q(g_ssid[k]).c_str(), q(g_wpass[k]).c_str());
+        String v;
+        v = p.getString("host", ""); if (v.length()) Serial.printf("host %s\n", v.c_str());
+        v = p.getString("appass", ""); if (v.length()) Serial.printf("ap %s\n", q(v).c_str());
+        v = p.getString("hpass", ""); if (v.length()) Serial.printf("admin %s\n", q(v).c_str());
+        v = p.getString("xtok", ""); if (v.length()) Serial.printf("token %s\n", q(v).c_str());
+        Serial.printf("logger %u\n", (unsigned)g_lg_period_s.load());
+        Serial.printf("mode %s\n", g_sniff_only.load() ? "sniff" : "normal");
+        p.end();
+        break; }
+    case CliKind::ExtToken: { Preferences p; p.begin("gs", false); p.putString("xtok", c.a); p.end(); g_xtok = c.a; Serial.println("ext token saved"); break; }
     case CliKind::Reboot: Serial.println("rebooting"); Serial.flush(); delay(200); ESP.restart(); break;
     }
 }
@@ -630,6 +685,7 @@ void begin(uint32_t boot_id) {
     factory_reset_if_requested();
     g_cfg = load_config();
     { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); { uint32_t v = p.getUInt("lgp", 90); g_lg_period_s.store(v >= 30 && v <= 900 ? v : 90); g_lg_dirty.store(true); } p.end(); }
+    WiFi.onEvent(on_sta_event);
     connect_sta();
     Serial.println("serial console: type 'help'");
     configTime(0, 0, "pool.ntp.org", "time.google.com");     // всё время — UTC

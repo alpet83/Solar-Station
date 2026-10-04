@@ -67,6 +67,11 @@ bool valid_pass(const char* s) { size_t n = strlen(s); return n >= 8 && n <= 63;
 }  // namespace
 
 CliCmd cli_parse(const char* line, int max_nets) {
+    {   // комментарий — до разбора на токены (в нём может быть что угодно)
+        const char* q = line;
+        while (*q == ' ' || *q == '\t') ++q;
+        if (*q == '#') return CliCmd();
+    }
     Tok t[kMaxTok]; int n = 0;
     int r = tokenize(line, t, n);
     if (r == 1) return fail("unterminated quote");
@@ -80,6 +85,14 @@ CliCmd cli_parse(const char* line, int max_nets) {
     if (ieq(cmd, "status")) { c.kind = CliKind::Status; return c; }
     if (ieq(cmd, "nets")) { c.kind = CliKind::Nets; return c; }
     if (ieq(cmd, "reboot")) { c.kind = CliKind::Reboot; return c; }
+    if (ieq(cmd, "scan")) { c.kind = CliKind::Scan; return c; }
+    if (ieq(cmd, "export")) { c.kind = CliKind::Export; return c; }
+    if (ieq(cmd, "token")) {
+        if (n != 2) return fail("usage: token <16..63 chars>");
+        size_t len = strlen(t[1].s);
+        if (len < 16 || len > 63) return fail("token must be 16..63 chars");
+        c.kind = CliKind::ExtToken; strcpy(c.a, t[1].s); return c;
+    }
 
     if (ieq(cmd, "net")) {
         long k = 0;
@@ -156,9 +169,13 @@ const char* cli_help_text() {
         "  nets                        configured Wi-Fi networks (1 = main, others = backup)\n"
         "  net <1..4> <ssid> [pass]    set a network; no pass = open network; quote values with spaces\n"
         "  net <1..4> del              remove a network\n"
+        "  scan                        list visible Wi-Fi networks (check the SSID spelling / 2.4 GHz)\n"
+        "  export                      print all settings as commands (save to a file to restore later)\n"
         "  host <name>                 hostname (applies after reboot)\n"
         "  ap <password>               setup access point password (>= 8 chars)\n"
         "  admin <password>            web admin password (>= 8 chars)\n"
+        "  token <16..63 chars>        token for /api/ext (Pi sender)\n"
+        "  # text                      comment (ignored)\n"
         "  mode [sniff|normal]         show / set receive-only mode (saved)\n"
         "  logger <30..900>            expected cloud logger period, seconds\n"
         "  log [on|off]                periodic telemetry line on this console\n"
