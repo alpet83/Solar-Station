@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "gs_cli.h"
 
 #include <Preferences.h>
 #include <Update.h>
@@ -26,6 +27,7 @@ static std::atomic<int> g_manual{-1};
 static std::atomic<bool> g_sniff_only{false};
 static std::atomic<int64_t> g_api_at_ms{-1};
 static std::atomic<bool> g_mqtt_bad{false};
+static std::atomic<bool> g_serial_log{true};
 static std::atomic<uint32_t> g_lg_period_s{90};
 static std::atomic<bool> g_lg_dirty{false};
 static shell::SniffProvider g_sniff_prov = nullptr;
@@ -105,6 +107,7 @@ Link link_state() { return WiFi.status() == WL_CONNECTED ? Link::Connected : (g_
 uint64_t api_age_ms() { int64_t a = g_api_at_ms.load(); int64_t n = (int64_t)(esp_timer_get_time() / 1000); return a < 0 ? UINT64_MAX : (uint64_t)(n - a); }
 void set_mqtt_ok(bool ok) { g_mqtt_bad.store(!ok); }
 bool mqtt_bad() { return g_mqtt_bad.load(); }
+bool serial_log() { return g_serial_log.load(); }
 uint32_t logger_period_s() { return g_lg_period_s.load(); }
 bool take_logger_period(uint32_t& v) { if (!g_lg_dirty.exchange(false)) return false; v = g_lg_period_s.load(); return true; }
 bool sniff_only() { return g_sniff_only.load(); }
@@ -269,7 +272,7 @@ static void h_mode() {
         static Snapshot s;
         if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
         s = g_snap; xSemaphoreGive(g_mtx);
-        if (s.tel.ongrid_reg != 1) { g_http.send(409, "text/plain", "grid must be connected (20105=1) to enter sniff mode"); return; }
+        if (!gs::sniff_entry_ok(s.tel.ongrid_reg)) { g_http.send(409, "text/plain", "grid is disconnected (20105=0): sniff mode has no protection"); return; }
     }
     Preferences p; p.begin("gs", false); p.putBool("sniff", m == "sniff"); p.end();
     g_sniff_only.store(m == "sniff");
@@ -518,6 +521,108 @@ static void wifi_tick() {
     if (!g_ever_connected && !g_ap_mode && millis() - g_boot_ms > 120000) start_ap();
 }
 
+
+// ---- консоль по Serial ------------------------------------------------------------------------
+// Физический доступ к USB = доверенный доступ, поэтому без пароля. Выполняется в задаче оболочки
+// (как и HTTP-обработчики), гонок с массивами сетей нет.
+static String net_status_line(bool with_ap_hint) {
+    String s;
+    if (WiFi.status() == WL_CONNECTED)
+        s = "net: STA up ssid='" + WiFi.SSID() + "' ip=" + WiFi.localIP().toString() + " rssi=" + String(WiFi.RSSI()) +
+            " dBm net#" + String(g_net_cur + 1) + "/" + String(n_nets());
+    else if (!n_nets()) s = "net: no networks configured (use: net 1 <ssid> <pass>)";
+    else s = "net: STA down, trying #" + String(g_net_cur + 1) + " '" + (g_net_cur >= 0 ? g_ssid[g_net_cur] : String("?")) + "'";
+    if (g_ap_mode) s += " | AP on ssid=gs-setup-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX) + " ip=" + WiFi.softAPIP().toString();
+    else if (with_ap_hint) s += " | AP off";
+    return s;
+}
+
+// Строка статуса: сразу при смене состояния и раз в 30 с — чтобы по консоли всегда было видно, где плата.
+static void net_status_tick() {
+    static String last; static uint32_t at = 0;
+    String key = WiFi.status() == WL_CONNECTED ? "up:" + WiFi.SSID() + WiFi.localIP().toString() : String("down:") + g_net_cur + (g_ap_mode ? "ap" : "");
+    if (key != last || millis() - at >= 30000) { last = key; at = millis(); Serial.println(net_status_line(true)); }
+}
+
+static void nets_reload_apply(int k, bool deleted) {     // сети изменились: применяем без перезагрузки
+    if (!n_nets()) { WiFi.disconnect(false, false); return; }
+    const bool conn = WiFi.status() == WL_CONNECTED;
+    if (!conn) { g_was_conn = false; if (deleted && k == g_net_cur) next_net(); else begin_net(k); }
+    else if (k == g_net_cur) { if (deleted) next_net(); else begin_net(k); }
+}
+
+static void cli_exec(const gs::CliCmd& c) {
+    using gs::CliKind;
+    switch (c.kind) {
+    case CliKind::None: break;
+    case CliKind::Error: Serial.printf("error: %s\n", c.err); break;
+    case CliKind::Help: Serial.print(gs::cli_help_text()); break;
+    case CliKind::Status: Serial.println(net_status_line(true)); Serial.printf("rev %s, mode %s, uptime %lu s\n", kRev, g_sniff_only.load() ? "sniff" : "normal", (unsigned long)(now_ms() / 1000)); break;
+    case CliKind::Nets:
+        for (int k = 0; k < kNets; ++k) {
+            if (!g_ssid[k].length()) { Serial.printf("%d. (empty)\n", k + 1); continue; }
+            Serial.printf("%d. '%s' %s%s\n", k + 1, g_ssid[k].c_str(), g_wpass[k].length() ? "pass=*** " : "(open) ",
+                          (WiFi.status() == WL_CONNECTED && k == g_net_cur) ? "<- connected" : "");
+        }
+        break;
+    case CliKind::NetSet: {
+        const int k = c.net - 1;
+        Preferences p; p.begin("gs", false);
+        p.putString(("s" + String(k)).c_str(), c.a); p.putString(("w" + String(k)).c_str(), c.b);
+        p.remove("ssid"); p.remove("pass"); p.end();
+        g_ssid[k] = c.a; g_wpass[k] = c.b;
+        Serial.printf("net %d saved: '%s' %s\n", c.net, c.a, c.b[0] ? "" : "(open)");
+        nets_reload_apply(k, false);
+        break; }
+    case CliKind::NetDel: {
+        const int k = c.net - 1;
+        Preferences p; p.begin("gs", false);
+        p.remove(("s" + String(k)).c_str()); p.remove(("w" + String(k)).c_str()); p.remove("ssid"); p.remove("pass"); p.end();
+        g_ssid[k] = ""; g_wpass[k] = "";
+        Serial.printf("net %d removed\n", c.net);
+        nets_reload_apply(k, true);
+        break; }
+    case CliKind::Host: { Preferences p; p.begin("gs", false); p.putString("host", c.a); p.end(); Serial.println("hostname saved, applies after reboot"); break; }
+    case CliKind::ApPass: { Preferences p; p.begin("gs", false); p.putString("appass", c.a); p.end(); Serial.println("AP password saved, applies at next AP start"); break; }
+    case CliKind::AdminPass: { Preferences p; p.begin("gs", false); p.putString("hpass", c.a); p.end(); g_http_pass = c.a; Serial.println("admin password saved"); break; }
+    case CliKind::Mode:
+        if (c.flag < 0) { Serial.printf("mode: %s\n", g_sniff_only.load() ? "sniff" : "normal"); break; }
+        if (c.flag == 1) {
+            static Snapshot s;
+            if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { Serial.println("error: busy, retry"); break; }
+            s = g_snap; xSemaphoreGive(g_mtx);
+            if (!gs::sniff_entry_ok(s.tel.ongrid_reg)) { Serial.println("error: grid is disconnected (20105=0): sniff mode has no protection"); break; }
+        }
+        { Preferences p; p.begin("gs", false); p.putBool("sniff", c.flag == 1); p.end(); }
+        g_sniff_only.store(c.flag == 1);
+        Serial.printf("mode: %s\n", c.flag == 1 ? "sniff (receive only, no bus writes)" : "normal (active control)");
+        break;
+    case CliKind::Logger: {
+        Preferences p; p.begin("gs", false); p.putUInt("lgp", (uint32_t)c.num); p.end();
+        g_lg_period_s.store((uint32_t)c.num); g_lg_dirty.store(true);
+        Serial.printf("logger period: %ld s\n", c.num);
+        break; }
+    case CliKind::Log:
+        if (c.flag >= 0) g_serial_log.store(c.flag == 1);
+        Serial.printf("log: %s\n", g_serial_log.load() ? "on" : "off");
+        break;
+    case CliKind::Reboot: Serial.println("rebooting"); Serial.flush(); delay(200); ESP.restart(); break;
+    }
+}
+
+static void cli_poll() {
+    static gs::CliLine ln;
+    static bool shown_prompt = false;
+    int guard = 0;
+    while (Serial.available() > 0 && guard++ < 256) {
+        const char ch = (char)Serial.read();
+        if (ch == '\r' || ch == '\n') { if (shown_prompt) { Serial.print("\r\n"); shown_prompt = false; } }
+        else if ((unsigned char)ch >= 0x20 || ch == 0x08 || ch == 0x7f) { if (ch == 0x08 || ch == 0x7f) Serial.print("\b \b"); else Serial.write(ch); shown_prompt = true; }
+        if (ln.feed(ch)) { cli_exec(gs::cli_parse(ln.line(), kNets)); shown_prompt = false; }
+        else if (ln.overflowed()) Serial.println("error: line too long");
+    }
+}
+
 void begin(uint32_t boot_id) {
     g_boot_id = boot_id;
     g_mtx = xSemaphoreCreateMutex();
@@ -525,6 +630,7 @@ void begin(uint32_t boot_id) {
     g_cfg = load_config();
     { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); { uint32_t v = p.getUInt("lgp", 90); g_lg_period_s.store(v >= 30 && v <= 900 ? v : 90); g_lg_dirty.store(true); } p.end(); }
     connect_sta();
+    Serial.println("serial console: type 'help'");
     configTime(0, 0, "pool.ntp.org", "time.google.com");     // всё время — UTC
     const char* hdr[] = {"X-GS", "X-GS-Token", "Authorization"};
     g_http.collectHeaders(hdr, 3);
@@ -548,6 +654,8 @@ void loop() {
     g_hb_ms.store(now_ms());
     g_http.handleClient();
     wifi_tick();
+    cli_poll();
+    net_status_tick();
     // OTA-образ считается рабочим только при признаках здоровья: ядро сделало >= 10 циклов
     // (шина опрашивается) и прошло >= 2 минут. На платах без rollback в загрузчике вызов безвреден.
     if (!g_ota_validated && now_ms() > 120000 && g_publishes.load() >= 10) {

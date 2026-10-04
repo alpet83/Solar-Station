@@ -1,0 +1,125 @@
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include "gs_cli.h"
+
+using namespace gs;
+static int g_fail = 0, g_n = 0;
+#define CHECK(c) do { ++g_n; if (!(c)) { ++g_fail; printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
+
+static bool is_err(const CliCmd& c) { return c.kind == CliKind::Error; }
+
+static void test_simple() {
+    CHECK(cli_parse("", 4).kind == CliKind::None);
+    CHECK(cli_parse("   \t ", 4).kind == CliKind::None);
+    CHECK(cli_parse("help", 4).kind == CliKind::Help);
+    CHECK(cli_parse("HELP", 4).kind == CliKind::Help);
+    CHECK(cli_parse("?", 4).kind == CliKind::Help);
+    CHECK(cli_parse("status", 4).kind == CliKind::Status);
+    CHECK(cli_parse("nets", 4).kind == CliKind::Nets);
+    CHECK(cli_parse("reboot", 4).kind == CliKind::Reboot);
+    CHECK(is_err(cli_parse("frobnicate", 4)));
+}
+
+static void test_net() {
+    CliCmd c = cli_parse("net 2 HomeWiFi secret123", 4);
+    CHECK(c.kind == CliKind::NetSet && c.net == 2 && !strcmp(c.a, "HomeWiFi") && !strcmp(c.b, "secret123"));
+    c = cli_parse("net 1 OpenNet", 4);
+    CHECK(c.kind == CliKind::NetSet && c.net == 1 && !strcmp(c.a, "OpenNet") && c.b[0] == 0);
+    c = cli_parse("net 3 \"My Home Wi-Fi\" \"pass with space\"", 4);
+    CHECK(c.kind == CliKind::NetSet && !strcmp(c.a, "My Home Wi-Fi") && !strcmp(c.b, "pass with space"));
+    c = cli_parse("net 3 \"a\\\"b\\\\c\" \"12345678\"", 4);
+    CHECK(c.kind == CliKind::NetSet && !strcmp(c.a, "a\"b\\c"));
+    c = cli_parse("net 4 del", 4);
+    CHECK(c.kind == CliKind::NetDel && c.net == 4);
+    c = cli_parse("net 4 DEL", 4);
+    CHECK(c.kind == CliKind::NetDel);
+    c = cli_parse("net 4 \"del\"", 4);                 // SSID, буквально названный del
+    CHECK(c.kind == CliKind::NetSet && !strcmp(c.a, "del"));
+    c = cli_parse("net 4 del 12345678", 4);            // SSID del с паролем
+    CHECK(c.kind == CliKind::NetSet && !strcmp(c.a, "del"));
+    CHECK(is_err(cli_parse("net 0 x", 4)));
+    CHECK(is_err(cli_parse("net 5 x", 4)));
+    CHECK(is_err(cli_parse("net x y", 4)));
+    CHECK(is_err(cli_parse("net 1", 4)));
+    CHECK(is_err(cli_parse("net 1 ssid short", 4)));                       // пароль < 8
+    CHECK(is_err(cli_parse("net 1 ssid 123456789012345678901234567890123456789012345678901234567890123456", 4)));   // > 63
+    CHECK(is_err(cli_parse("net 1 123456789012345678901234567890123", 4)));   // ssid 33
+    CHECK(cli_parse("net 1 123456789012345678901234567890xy", 4).kind == CliKind::NetSet);   // ssid 32
+    CHECK(is_err(cli_parse("net 1 a b c", 4)));
+    CHECK(is_err(cli_parse("net 1 \"unterminated", 4)));
+    CHECK(is_err(cli_parse("net 1 \"\"", 4)));                              // пустой ssid
+    c = cli_parse("net 1 ssid \"\"", 4);                                   // пустой пароль = открытая
+    CHECK(c.kind == CliKind::NetSet && c.b[0] == 0);
+    c = cli_parse("net 2 s p4ssw0rd", 2);
+    CHECK(c.kind == CliKind::NetSet);
+    CHECK(is_err(cli_parse("net 3 s", 2)));
+}
+
+static void test_other() {
+    CliCmd c = cli_parse("host my-pi-1", 4);
+    CHECK(c.kind == CliKind::Host && !strcmp(c.a, "my-pi-1"));
+    CHECK(is_err(cli_parse("host bad_name", 4)));
+    CHECK(is_err(cli_parse("host", 4)));
+    CHECK(is_err(cli_parse("host 123456789012345678901234567890123", 4)));
+    c = cli_parse("ap 12345678", 4);
+    CHECK(c.kind == CliKind::ApPass && !strcmp(c.a, "12345678"));
+    CHECK(is_err(cli_parse("ap 1234567", 4)));
+    CHECK(cli_parse("admin longenough", 4).kind == CliKind::AdminPass);
+    CHECK(is_err(cli_parse("admin x", 4)));
+    CHECK(cli_parse("mode", 4).kind == CliKind::Mode && cli_parse("mode", 4).flag == -1);
+    CHECK(cli_parse("mode sniff", 4).flag == 1);
+    CHECK(cli_parse("mode normal", 4).flag == 0);
+    CHECK(is_err(cli_parse("mode active", 4)));
+    c = cli_parse("logger 90", 4);
+    CHECK(c.kind == CliKind::Logger && c.num == 90);
+    CHECK(is_err(cli_parse("logger 10", 4)));
+    CHECK(is_err(cli_parse("logger 901", 4)));
+    CHECK(is_err(cli_parse("logger abc", 4)));
+    CHECK(cli_parse("log", 4).flag == -1);
+    CHECK(cli_parse("log off", 4).flag == 0);
+    CHECK(cli_parse("log on", 4).flag == 1);
+    CHECK(is_err(cli_parse("log maybe", 4)));
+    CHECK(is_err(cli_parse("a b c d e f g", 4)));            // > 5 токенов
+    CHECK(is_err(cli_parse("net 1 ssid 12345678 extra extra2", 4)));
+}
+
+static void test_line() {
+    CliLine l;
+    auto feed_all = [&](const char* s, std::string& out) {
+        out.clear();
+        for (; *s; ++s) if (l.feed(*s)) out = l.line();
+    };
+    std::string out;
+    feed_all("status\r\n", out);
+    CHECK(out == "status");
+    feed_all("\n\r\n", out);                                  // пустые строки не возвращаются
+    CHECK(out.empty());
+    feed_all("abx\x7f\x08" "c\n", out);                      // BS/DEL стирают (оба стёрли x и b)
+    CHECK(out == "ac");
+    feed_all("a\nb\n", out);
+    CHECK(out == "b");
+    std::string big(400, 'x');
+    big += "\n";
+    bool got = false, over = false;
+    for (char ch : big) { if (l.feed(ch)) got = true; if (l.overflowed()) over = true; }
+    CHECK(!got && over);
+    feed_all("help\n", out);                                  // после переполнения работает
+    CHECK(out == "help");
+    CHECK(!l.overflowed());
+    feed_all("a\x01" "b\n", out);                             // управляющие символы игнорируются
+    CHECK(out == "ab");
+}
+
+static void test_sniff_policy() {
+    CHECK(sniff_entry_ok(1));
+    CHECK(sniff_entry_ok(-1));
+    CHECK(!sniff_entry_ok(0));
+}
+
+int main() {
+    test_simple(); test_net(); test_other(); test_line(); test_sniff_policy();
+    CHECK(strstr(cli_help_text(), "net <1..4>") != nullptr);
+    printf("%d checks, %d failed\n", g_n, g_fail);
+    return g_fail ? 1 : 0;
+}

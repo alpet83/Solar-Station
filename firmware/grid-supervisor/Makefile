@@ -1,13 +1,14 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Ilib/gs_core -Ilib/gs_modbus -Ilib/gs_util -Ilib/gs_bus -Ilib/gs_led -Wall -Wextra -O1 -g -fsanitize=address,undefined
+CXXFLAGS ?= -std=c++17 -Ilib/gs_core -Ilib/gs_modbus -Ilib/gs_util -Ilib/gs_bus -Ilib/gs_led -Ilib/gs_cli -Wall -Wextra -O1 -g -fsanitize=address,undefined
 
 .PHONY: test clean
-test: build/test_gs_core build/test_gs_modbus build/test_gs_util build/test_gs_bus build/test_gs_led
+test: build/test_gs_core build/test_gs_modbus build/test_gs_util build/test_gs_bus build/test_gs_led build/test_gs_cli
 	./build/test_gs_core test/native/fixtures/incident_2026-10-01.csv
 	./build/test_gs_modbus
 	./build/test_gs_util
 	./build/test_gs_bus
 	./build/test_gs_led
+	./build/test_gs_cli
 
 build/test_gs_core: test/native/test_gs_core.cpp lib/gs_core/gs_core.cpp lib/gs_core/gs_core.h
 	@mkdir -p build
@@ -28,6 +29,10 @@ build/test_gs_bus: test/native/test_gs_bus.cpp lib/gs_bus/gs_bus.cpp lib/gs_bus/
 build/test_gs_led: test/native/test_gs_led.cpp lib/gs_led/gs_led.cpp lib/gs_led/gs_led.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ test/native/test_gs_led.cpp lib/gs_led/gs_led.cpp
+
+build/test_gs_cli: test/native/test_gs_cli.cpp lib/gs_cli/gs_cli.cpp lib/gs_cli/gs_cli.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -o $@ test/native/test_gs_cli.cpp lib/gs_cli/gs_cli.cpp
 
 clean:
 	rm -rf build

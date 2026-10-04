@@ -45,4 +45,6 @@ uint64_t api_age_ms();                         // давность послед�
 void set_mqtt_ok(bool ok);                     // зарезервировано под MQTT на плате; пока не вызывается
 bool mqtt_bad();
 
+bool serial_log();                             // печатать ли периодическую строку телеметрии в Serial (по умолчанию да)
+
 }  // namespace shell
