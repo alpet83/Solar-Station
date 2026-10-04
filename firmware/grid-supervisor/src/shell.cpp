@@ -318,6 +318,7 @@ static const char kUpdForm[] PROGMEM =
 static void h_update_form() { if (authed(false)) g_http.send_P(200, "text/html", kUpdForm); }
 
 static bool g_upd_auth = false, g_upd_ok = false, g_upd_first = false;
+static uint32_t g_upd_bytes = 0;
 static String g_upd_err;
 
 static void h_update_done() {
@@ -334,7 +335,7 @@ static void h_update_upload() {
     HTTPUpload& up = g_http.upload();
     if (up.status == UPLOAD_FILE_START) {
         g_upd_auth = basic_ok() && g_http.hasHeader("X-GS");
-        g_upd_ok = false; g_upd_err = ""; g_upd_first = true;
+        g_upd_ok = false; g_upd_err = ""; g_upd_first = true; g_upd_bytes = 0;
         if (!g_upd_auth) return;
         g_ota_active = true;
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) upd_fail("begin");
@@ -348,8 +349,15 @@ static void h_update_upload() {
             if (magic != 0xABCD5432u) { upd_fail("no app descriptor"); return; }
         }
         if (Update.write(up.buf, up.currentSize) != up.currentSize) upd_fail("write");
+        g_upd_bytes += up.currentSize;
     } else if (up.status == UPLOAD_FILE_END) {
-        if (Update.isRunning()) g_upd_ok = Update.end(false);     // false: размер должен совпасть с записанным
+        // Размер заранее неизвестен (UPDATE_SIZE_UNKNOWN): end(true) берёт фактически записанное и сбрасывает
+        // остаток буфера; end(false) требует совпадения с размером раздела и всегда падает ("premature end").
+        // Целостность образа проверяет сам загрузчик обновления (esp_image_verify) при выборе раздела.
+        if (Update.isRunning()) {
+            if (g_upd_bytes < 200000) upd_fail("image too small");
+            else g_upd_ok = Update.end(true);
+        }
         if (!g_upd_ok && !g_upd_err.length()) g_upd_err = Update.errorString();
         g_ota_active = false;
     } else if (up.status == UPLOAD_FILE_ABORTED) {
