@@ -80,6 +80,7 @@ size_t battery_brief_json(const BatteryBrief& b, char* out, size_t cap);
 // Состояние драйвера для /api/can (заполняет src/can_rx.cpp).
 struct CanDriverInfo {
     bool enabled = false; uint16_t speed_kbps = 0;
+    bool ack = false;                          // true: узел подтверждает кадры (ACK, режим normal без очереди передачи); false: listen-only
     const char* state = "off";                 // off / running / stopped / bus_off / recovering
     uint32_t rx_msgs = 0, rx_missed = 0, bus_errors = 0, bus_off_count = 0, rx_err_counter = 0;
 };

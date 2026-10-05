@@ -25,6 +25,8 @@
 namespace canrx {
 
 static std::atomic<int> g_want{500};         // заданная скорость, кбит/с (0 = выключено)
+static std::atomic<bool> g_ack{false};      // подтверждать кадры (ACK) вместо чистого listen-only
+static bool g_cur_ack = false;
 static int g_cur = -1;                       // применённая задачей (-1 — ещё ничего)
 static bool g_installed = false;
 static SemaphoreHandle_t g_mtx;
@@ -36,7 +38,7 @@ static uint32_t g_base_missed = 0, g_base_errs = 0;     // счётчики пр
 static uint32_t ms32() { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 static bool drv_install(int kbps) {
-    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)GS_CAN_TX, (gpio_num_t)GS_CAN_RX, TWAI_MODE_LISTEN_ONLY);
+    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)GS_CAN_TX, (gpio_num_t)GS_CAN_RX, g_ack.load() ? TWAI_MODE_NORMAL : TWAI_MODE_LISTEN_ONLY);
     g.rx_queue_len = 32;
     g.tx_queue_len = 0;                      // очередь передачи отключена: передавать нечем
     twai_timing_config_t t250 = TWAI_TIMING_CONFIG_250KBITS();
@@ -67,11 +69,11 @@ static void apply(int want) {
     g_stats.clear(); g_bat = gs::PylonBattery();
     g_base_missed = g_base_errs = 0;
     g_info = gs::CanDriverInfo();
-    g_info.enabled = want != 0; g_info.speed_kbps = (uint16_t)want;
+    g_info.enabled = want != 0; g_info.speed_kbps = (uint16_t)want; g_info.ack = g_ack.load();
     g_info.state = !want ? "off" : g_installed ? "running" : "error";
     xSemaphoreGive(g_mtx);
-    g_cur = want;
-    Serial.printf("can: %s\n", !want ? "off" : g_installed ? (want == 100 ? "listen-only 100 kbit/s" : want == 125 ? "listen-only 125 kbit/s" : want == 250 ? "listen-only 250 kbit/s" : "listen-only 500 kbit/s") : "driver install FAILED, will retry");
+    g_cur = want; g_cur_ack = g_ack.load();
+    Serial.printf("can: %s%s\n", !want ? "off" : g_installed ? (want == 100 ? "listen-only 100 kbit/s" : want == 125 ? "listen-only 125 kbit/s" : want == 250 ? "listen-only 250 kbit/s" : "listen-only 500 kbit/s") : "driver install FAILED, will retry", want && g_cur_ack ? " (+ACK)" : "");
 }
 
 // Раз в ~0.5 с: состояние шины и счётчики; bus-off -> автоперезапуск.
@@ -101,7 +103,7 @@ static void can_task(void*) {
     uint32_t hk = 0, retry = 0;
     for (;;) {
         const int want = g_want.load();
-        if (want != g_cur) { apply(want); retry = millis(); }
+        if (want != g_cur || g_ack.load() != g_cur_ack) { apply(want); retry = millis(); }
         if (!want) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
         if (!g_installed) {                                             // установка не удалась: повтор раз в 5 с
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -129,6 +131,7 @@ void begin() {
     Preferences p; p.begin("gs", true);
     uint32_t v = p.getUInt("can", 500);
     p.end();
+    { Preferences q; q.begin("gs", true); g_ack.store(q.getBool("canack", false)); q.end(); }
     g_want.store(v == 0 || v == 100 || v == 125 || v == 250 ? (int)v : 500);
     xTaskCreatePinnedToCore(can_task, "gs_can", 4096, nullptr, 2, nullptr, 0);
 }
@@ -138,6 +141,12 @@ void set_speed(int kbps) {
     Preferences p; p.begin("gs", false); p.putUInt("can", (uint32_t)kbps); p.end();
     g_want.store(kbps);
 }
+
+void set_ack(bool on) {
+    Preferences p; p.begin("gs", false); p.putBool("canack", on); p.end();
+    g_ack.store(on);
+}
+bool ack() { return g_ack.load(); }
 
 int speed() { return g_want.load(); }
 
@@ -159,8 +168,8 @@ void status_line(char* out, size_t cap) {
     if (g_mtx && xSemaphoreTake(g_mtx, pdMS_TO_TICKS(50))) { d = g_info; xSemaphoreGive(g_mtx); }
     const int want = g_want.load();
     if (!want) { snprintf(out, cap, "can: off"); return; }
-    snprintf(out, cap, "can: %d kbit/s listen-only, state=%s rx=%lu missed=%lu bus_err=%lu bus_off=%lu",
-             want, d.state, (unsigned long)d.rx_msgs, (unsigned long)d.rx_missed, (unsigned long)d.bus_errors, (unsigned long)d.bus_off_count);
+    snprintf(out, cap, "can: %d kbit/s %s, state=%s rx=%lu missed=%lu bus_err=%lu bus_off=%lu",
+             want, g_ack.load() ? "normal (ACK)" : "listen-only", d.state, (unsigned long)d.rx_msgs, (unsigned long)d.rx_missed, (unsigned long)d.bus_errors, (unsigned long)d.bus_off_count);
 }
 
 }  // namespace canrx
