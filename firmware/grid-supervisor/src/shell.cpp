@@ -265,11 +265,11 @@ static void h_can() {
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
 }
 
-// POST /api/can  speed=0|125|250|500 — скорость CAN-сниффера, кбит/с (0 = выключить); сохраняется в NVS.
+// POST /api/can  speed=0|100|125|250|500 — скорость CAN-сниффера, кбит/с (0 = выключить); сохраняется в NVS.
 static void h_can_set() {
     if (!authed(true)) return;
     String v = g_http.arg("speed");
-    if (v != "0" && v != "125" && v != "250" && v != "500") { g_http.send(400, "text/plain", "speed must be 0, 125, 250 or 500"); return; }
+    if (v != "0" && v != "100" && v != "125" && v != "250" && v != "500") { g_http.send(400, "text/plain", "speed must be 0, 100, 125, 250 or 500"); return; }
     canrx::set_speed(v.toInt());
     g_http.send(200, "text/plain", "ok");
 }

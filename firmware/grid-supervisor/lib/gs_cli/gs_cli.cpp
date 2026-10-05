@@ -145,8 +145,8 @@ CliCmd cli_parse(const char* line, int max_nets) {
         c.kind = CliKind::Can;
         if (n == 1) return c;
         if (n == 2 && ieq(t[1].s, "off")) { c.flag = 1; c.num = 0; return c; }
-        if (n == 2 && !t[1].quoted && (!strcmp(t[1].s, "125") || !strcmp(t[1].s, "250") || !strcmp(t[1].s, "500"))) { c.flag = 1; c.num = atol(t[1].s); return c; }
-        return fail("usage: can [off|125|250|500]");
+        if (n == 2 && !t[1].quoted && (!strcmp(t[1].s, "100") || !strcmp(t[1].s, "125") || !strcmp(t[1].s, "250") || !strcmp(t[1].s, "500"))) { c.flag = 1; c.num = atol(t[1].s); return c; }
+        return fail("usage: can [off|100|125|250|500]");
     }
     return fail("unknown command, type 'help'");
 }
@@ -186,7 +186,7 @@ const char* cli_help_text() {
         "  mode [sniff|normal]         show / set receive-only mode (saved)\n"
         "  logger <30..900>            expected cloud logger period, seconds\n"
         "  log [on|off]                periodic telemetry line on this console\n"
-        "  can [off|125|250|500]         show / set CAN sniffer (listen-only) speed, kbit/s (saved)\n"
+        "  can [off|100|125|250|500]         show / set CAN sniffer (listen-only) speed, kbit/s (saved)\n"
         "  reboot\n";
 }
 
