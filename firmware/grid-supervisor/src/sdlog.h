@@ -4,6 +4,7 @@
 #pragma once
 #include <Arduino.h>
 #include <WebServer.h>
+#include "gs_core.h"
 #include "gs_log.h"
 
 namespace sdlog {
@@ -19,5 +20,15 @@ void flush_now();
 size_t status_json(char* out, size_t cap);
 // Отдаёт файл клиенту (имя проверяется gs::valid_log_name). false — файла/карты нет (ответ не отправлен).
 bool stream_file(WebServer& srv, const char* name);
+
+// ---- история конфигурации (/m/cfg_history.jsonl, формат — lib/gs_cfghist) ----
+typedef bool (*CfgProvider)(gs::Config& out);
+void set_cfg_provider(CfgProvider p);        // источник текущей конфигурации: при первом монтировании пишется запись «baseline»
+// Дописывает запись об изменении (before → after); без изменений — ничего не пишет. false — карты нет/ошибка записи.
+bool cfg_record(const gs::Config& before, const gs::Config& after, int64_t epoch_s, const char* src);
+// JSON {"items":[{id,t,src,ch},...]} — последние max_items записей (от старых к новым); false — нет карты/не получилось.
+bool cfg_list_json(char* out, size_t cap, size_t max_items);
+// Находит запись по id; line — буфер ≥ gs::kCfgHistLineMax.
+bool cfg_find(uint32_t id, char* line, size_t cap, size_t& len);
 
 }  // namespace sdlog

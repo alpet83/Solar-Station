@@ -1,5 +1,7 @@
 #include "sdlog.h"
 
+#include "gs_cfghist.h"
+
 #include <SD.h>
 #include <SPI.h>
 #include <freertos/FreeRTOS.h>
@@ -162,6 +164,110 @@ static void flush_pass(bool force) {
     if (millis() - g_last_retention_ms > 3600000UL) { g_last_retention_ms = millis(); retention(); }   // раз в час (место/срок)
 }
 
+// ---- история конфигурации -----------------------------------------------------------------------
+static const char* const kCfgFile = "/m/cfg_history.jsonl";
+static constexpr uint32_t kCfgRotateBytes = 200000;
+static CfgProvider g_cfg_provider = nullptr;
+static uint32_t g_cfg_next_id = 0;                 // 0 — ещё не определён (сканируем файл при первом обращении)
+
+// Построчное чтение файла (строки длиннее lcap пропускаются). fn(line, len) → false прерывает обход. true — файл открыт.
+template <typename F>
+static bool for_each_line(const char* path, char* lbuf, size_t lcap, F fn) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    uint8_t chunk[256]; size_t n = 0; bool over = false, stop = false;
+    for (int r; !stop && (r = f.read(chunk, sizeof chunk)) > 0;) {
+        for (int i = 0; i < r && !stop; ++i) {
+            const char c = (char)chunk[i];
+            if (c == '\n') { if (!over && n && !fn(lbuf, n)) stop = true; n = 0; over = false; }
+            else if (n < lcap) lbuf[n++] = c;
+            else over = true;
+        }
+    }
+    f.close();
+    return true;
+}
+
+static void cfg_scan_ids(char* lbuf, size_t lcap) {
+    if (g_cfg_next_id) return;
+    uint32_t mx = 0;
+    for_each_line(kCfgFile, lbuf, lcap, [&](const char* l, size_t n) { gs::CfgHistHeader h; if (gs::cfg_hist_header(l, n, h) && h.id > mx) mx = h.id; return true; });
+    g_cfg_next_id = mx + 1;
+}
+
+// Вызывать с взятым g_sd_mtx и смонтированной картой. lbuf — буфер ≥ kCfgHistLineMax.
+static bool cfg_record_locked(const gs::Config& before, const gs::Config& after, int64_t epoch_s, const char* src, bool force, char* lbuf) {
+    cfg_scan_ids(lbuf, gs::kCfgHistLineMax);
+    const size_t n = gs::cfg_hist_line(before, after, epoch_s, g_cfg_next_id, src, force, lbuf, gs::kCfgHistLineMax);
+    if (!n) return true;                                           // изменений нет — не ошибка
+    File f = SD.open(kCfgFile, FILE_READ);
+    if (f) { const uint32_t sz = f.size(); f.close(); if (sz > kCfgRotateBytes) { SD.remove("/m/cfg_history.old"); SD.rename(kCfgFile, "/m/cfg_history.old"); } }
+    if (!append_file(kCfgFile, "", lbuf, n)) return false;
+    ++g_cfg_next_id;
+    return true;
+}
+
+void set_cfg_provider(CfgProvider p) { g_cfg_provider = p; }
+
+bool cfg_record(const gs::Config& before, const gs::Config& after, int64_t epoch_s, const char* src) {
+    if (!g_mounted || !g_sd_mtx) return false;
+    char* lbuf = new (std::nothrow) char[gs::kCfgHistLineMax];
+    if (!lbuf) return false;
+    bool ok = false;
+    if (xSemaphoreTake(g_sd_mtx, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        if (g_mounted) { ok = cfg_record_locked(before, after, epoch_s, src, false, lbuf); if (!ok) unmount_card("cfg write failed"); }
+        xSemaphoreGive(g_sd_mtx);
+    }
+    delete[] lbuf;
+    return ok;
+}
+
+bool cfg_list_json(char* out, size_t cap, size_t max_items) {
+    if (!g_mounted || !g_sd_mtx || cap < 64) return false;
+    char* lbuf = new (std::nothrow) char[gs::kCfgHistLineMax];
+    if (!lbuf) return false;
+    bool ok = false;
+    if (xSemaphoreTake(g_sd_mtx, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        if (g_mounted) {
+            size_t total = 0;
+            for_each_line(kCfgFile, lbuf, gs::kCfgHistLineMax, [&](const char*, size_t) { ++total; return true; });
+            const size_t skip = total > max_items ? total - max_items : 0;
+            size_t idx = 0, n = (size_t)snprintf(out, cap, "{\"items\":["), emitted = 0; bool trunc = false;
+            for_each_line(kCfgFile, lbuf, gs::kCfgHistLineMax, [&](const char* l, size_t len) {
+                if (idx++ < skip) return true;
+                char sm[640]; size_t k = gs::cfg_hist_summary(l, len, sm, sizeof sm);
+                if (!k) return true;
+                if (n + k + 24 >= cap) { trunc = true; return false; }
+                if (emitted++) out[n++] = ',';
+                memcpy(out + n, sm, k); n += k;
+                return true;
+            });
+            n += (size_t)snprintf(out + n, cap - n, "]%s}", trunc ? ",\"truncated\":true" : "");
+            ok = n < cap;
+        }
+        xSemaphoreGive(g_sd_mtx);
+    }
+    delete[] lbuf;
+    return ok;
+}
+
+bool cfg_find(uint32_t id, char* line, size_t cap, size_t& len) {
+    if (!g_mounted || !g_sd_mtx || cap < gs::kCfgHistLineMax) return false;
+    bool found = false;
+    if (xSemaphoreTake(g_sd_mtx, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        if (g_mounted) {
+            for_each_line(kCfgFile, line, cap, [&](const char* l, size_t n) {
+                gs::CfgHistHeader h;
+                if (gs::cfg_hist_header(l, n, h) && h.id == id) { len = n; found = true; return false; }
+                return true;
+            });
+        }
+        xSemaphoreGive(g_sd_mtx);
+    }
+    return found;
+}
+
+
 static void task(void*) {
     uint32_t next_try = kFirstTryMs;
     for (;;) {
@@ -170,7 +276,14 @@ static void task(void*) {
         if (!g_mounted && (int32_t)(millis() - next_try) >= 0) {
             next_try = millis() + kRetryMs;
             g_mounted = mount_card();
-            if (g_mounted) { g_last_retention_ms = millis(); Serial.println("SD: mounted"); }
+            if (g_mounted) {
+                g_last_retention_ms = millis(); Serial.println("SD: mounted");
+                if (g_cfg_provider && !SD.exists(kCfgFile)) {          // история пуста: первая запись — исходная конфигурация (для restore «к исходному»)
+                    gs::Config c; char* lb = new (std::nothrow) char[gs::kCfgHistLineMax];
+                    if (lb && g_cfg_provider(c)) { time_t tt = time(nullptr); cfg_record_locked(c, c, tt > 1700000000 ? (int64_t)tt : -1, "baseline", true, lb); }
+                    delete[] lb;
+                }
+            }
         }
         if (g_mounted) flush_pass(false);
         xSemaphoreGive(g_sd_mtx);

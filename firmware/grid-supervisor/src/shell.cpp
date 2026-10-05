@@ -6,6 +6,7 @@
 #include "notify.h"
 #include "stats.h"
 #include "sdlog.h"
+#include "gs_cfghist.h"
 
 #include <Preferences.h>
 #include <Update.h>
@@ -214,11 +215,77 @@ static void h_config_set() {
     gs::Config c;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200))) { g_http.send(503, "text/plain", "busy"); return; }
     c = g_cfg; xSemaphoreGive(g_mtx);
+    const gs::Config c_before = c;
     if (!gs::config_apply_pairs(c, keys, vp, n)) { g_http.send(400, "text/plain", "rejected"); return; }
     save_config(c);                                   // медленная запись NVS — вне мьютекса
-    if (xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200))) { g_cfg = c; g_cfg_dirty = true; xSemaphoreGive(g_mtx); g_http.send(200, "text/plain", "ok"); }
+    if (xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200))) {
+        g_cfg = c; g_cfg_dirty = true; xSemaphoreGive(g_mtx); g_http.send(200, "text/plain", "ok");
+        sdlog::cfg_record(c_before, c, epoch_or_neg(), "api");        // история изменений на SD (без карты — пропускается)
+    }
     else g_http.send(503, "text/plain", "busy");
 }
+
+// Текущая конфигурация для sdlog (запись «baseline»).
+static bool cfg_provider(gs::Config& out) {
+    if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200))) return false;
+    out = g_cfg; xSemaphoreGive(g_mtx);
+    return true;
+}
+
+// GET /api/cfg_history — последние 20 изменений конфигурации (чтение открыто; в Config нет секретов).
+static void h_cfg_history() {
+    touch_api();
+    constexpr size_t kCap = 6144;
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[kCap]);
+    bool ok = buf && sdlog::cfg_list_json(buf.get(), kCap, 20);
+    g_http.sendHeader("Cache-Control", "no-store");
+    if (ok) g_http.send(200, "application/json", buf.get()); else g_http.send(503, "text/plain", buf ? "history unavailable (no card?)" : "no heap");
+}
+
+// POST /api/cfg_restore  id=N — вернуть конфигурацию ядра к снимку из записи N (пароль + X-GS). Применяется атомарно с проверкой validate().
+static void h_cfg_restore() {
+    if (!authed(true)) return;
+    touch_api();
+    if (!g_http.hasArg("id")) { g_http.send(400, "text/plain", "id required"); return; }
+    const long id = g_http.arg("id").toInt();
+    if (id <= 0) { g_http.send(400, "text/plain", "bad id"); return; }
+    std::unique_ptr<char[]> line(new (std::nothrow) char[gs::kCfgHistLineMax]);
+    if (!line) { g_http.send(503, "text/plain", "no heap"); return; }
+    size_t len = 0;
+    if (!sdlog::cfg_find((uint32_t)id, line.get(), gs::kCfgHistLineMax, len)) { g_http.send(404, "text/plain", "no such record (or no card)"); return; }
+    gs::Config before, c;
+    if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200))) { g_http.send(503, "text/plain", "busy"); return; }
+    before = g_cfg; xSemaphoreGive(g_mtx);
+    c = before;
+    if (!gs::cfg_hist_apply(line.get(), len, c)) { g_http.send(400, "text/plain", "rejected (snapshot invalid for this firmware)"); return; }
+    bool same = true;
+    for (size_t i = 0; i < gs::kCfgFieldCount && same; ++i) {
+        char a[24], b[24]; gs::config_get(before, gs::kCfgFields[i].key, a, sizeof a); gs::config_get(c, gs::kCfgFields[i].key, b, sizeof b);
+        same = !strcmp(a, b);
+    }
+    if (same) { g_http.send(200, "text/plain", "no change"); return; }
+    save_config(c);
+    if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200))) { g_http.send(503, "text/plain", "busy"); return; }
+    g_cfg = c; g_cfg_dirty = true; xSemaphoreGive(g_mtx);
+    g_http.send(200, "text/plain", "restored");
+    char src[24]; snprintf(src, sizeof src, "restore:%ld", id);
+    sdlog::cfg_record(before, c, epoch_or_neg(), src);
+}
+
+static const char kCfgPage[] PROGMEM =
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Config history</title>"
+    "<style>body{font:14px system-ui;margin:16px;max-width:900px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #8884;padding:6px;text-align:left;vertical-align:top}"
+    "code{font-size:12px;word-break:break-all}button{padding:4px 10px}</style>"
+    "<h3>История конфигурации</h3><p><a href=/>← главная</a> · записи только при вставленной карте; restore возвращает пороги ядра к выбранной записи.</p>"
+    "<table><thead><tr><th>#</th><th>Время (локально)</th><th>Источник</th><th>Изменения [было,стало]</th><th></th></tr></thead><tbody id=b></tbody></table><pre id=o></pre>"
+    "<script>async function L(){const o=document.getElementById('o');try{const r=await fetch('/api/cfg_history');if(!r.ok){o.textContent=await r.text();return}"
+    "const j=await r.json();const b=document.getElementById('b');b.innerHTML='';for(const e of j.items.reverse()){const tr=document.createElement('tr');"
+    "const t=e.t?new Date(e.t*1000).toLocaleString():'—';tr.innerHTML='<td>'+e.id+'</td><td>'+t+'</td><td>'+e.src+'</td><td><code>'+JSON.stringify(e.ch)+'</code></td><td></td>';"
+    "const bt=document.createElement('button');bt.textContent='Restore';bt.onclick=()=>R(e.id);tr.lastChild.appendChild(bt);b.appendChild(tr)}"
+    "if(j.truncated)o.textContent='(список усечён)'}catch(x){o.textContent=String(x)}}"
+    "async function R(id){if(!confirm('Вернуть конфигурацию к записи #'+id+'?'))return;const r=await fetch('/api/cfg_restore?id='+id,{method:'POST',headers:{'X-GS':'1'}});"
+    "document.getElementById('o').textContent=r.status+' '+await r.text();L()}L()</script>";
+static void h_cfg_page() { g_http.send_P(200, "text/html", kCfgPage); }
 
 // POST /api/ext  a=<ток, А>  — ток Epever от Pi. Принимает admin-пароль ИЛИ отдельный токен
 // (заголовок X-GS-Token), чтобы компрометация Pi не давала OTA. Значение живёт ext_ttl_ms.
@@ -431,7 +498,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/pvstats>pvstats</a> · <a href=/api/log>log</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/cfg>cfg history</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/pvstats>pvstats</a> · <a href=/api/log>log</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
@@ -905,6 +972,7 @@ void begin(uint32_t boot_id) {
     g_mtx = xSemaphoreCreateMutex();
     factory_reset_if_requested();
     g_cfg = load_config();
+    sdlog::set_cfg_provider(cfg_provider);          // sdlog пишет «baseline» при первом монтировании карты
     { Preferences p; p.begin("gs", true); g_sniff_only.store(p.getBool("sniff", false)); { uint32_t v = p.getUInt("lgp", 90); g_lg_period_s.store(v >= 30 && v <= 900 ? v : 90); g_lg_dirty.store(true); } p.end(); }
     WiFi.onEvent(on_sta_event);
     connect_sta();
@@ -917,6 +985,9 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/regs", HTTP_GET, h_regs);
     g_http.on("/api/config", HTTP_GET, h_config_get);
     g_http.on("/api/config", HTTP_POST, h_config_set);
+    g_http.on("/api/cfg_history", HTTP_GET, h_cfg_history);
+    g_http.on("/api/cfg_restore", HTTP_POST, h_cfg_restore);
+    g_http.on("/cfg", HTTP_GET, h_cfg_page);
     g_http.on("/api/ext", HTTP_POST, h_ext);
     g_http.on("/api/cmd", HTTP_POST, h_cmd);
     g_http.on("/api/sniff", HTTP_GET, h_sniff);
