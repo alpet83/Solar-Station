@@ -1,8 +1,8 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Ilib/gs_core -Ilib/gs_modbus -Ilib/gs_util -Ilib/gs_bus -Ilib/gs_led -Ilib/gs_cli -Ilib/gs_can -Ilib/gs_trig -Ilib/gs_notify -Ilib/gs_stats -Wall -Wextra -O1 -g -fsanitize=address,undefined
+CXXFLAGS ?= -std=c++17 -Ilib/gs_core -Ilib/gs_modbus -Ilib/gs_util -Ilib/gs_bus -Ilib/gs_led -Ilib/gs_cli -Ilib/gs_can -Ilib/gs_trig -Ilib/gs_notify -Ilib/gs_stats -Ilib/gs_log -Wall -Wextra -O1 -g -fsanitize=address,undefined
 
 .PHONY: test clean
-test: build/test_gs_core build/test_gs_modbus build/test_gs_util build/test_gs_bus build/test_gs_led build/test_gs_cli build/test_gs_can build/test_gs_trig build/test_gs_notify build/test_gs_stats
+test: build/test_gs_core build/test_gs_modbus build/test_gs_util build/test_gs_bus build/test_gs_led build/test_gs_cli build/test_gs_can build/test_gs_trig build/test_gs_notify build/test_gs_stats build/test_gs_log
 	./build/test_gs_core test/native/fixtures/incident_2026-10-01.csv
 	./build/test_gs_modbus
 	./build/test_gs_util
@@ -13,6 +13,7 @@ test: build/test_gs_core build/test_gs_modbus build/test_gs_util build/test_gs_b
 	./build/test_gs_trig
 	./build/test_gs_notify
 	./build/test_gs_stats
+	./build/test_gs_log
 
 build/test_gs_core: test/native/test_gs_core.cpp lib/gs_core/gs_core.cpp lib/gs_core/gs_core.h
 	@mkdir -p build
@@ -53,6 +54,10 @@ build/test_gs_notify: test/native/test_gs_notify.cpp lib/gs_notify/gs_notify.cpp
 build/test_gs_stats: test/native/test_gs_stats.cpp lib/gs_stats/gs_stats.cpp lib/gs_stats/gs_stats.h lib/gs_modbus/gs_modbus.cpp lib/gs_modbus/gs_modbus.h lib/gs_core/gs_core.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ test/native/test_gs_stats.cpp lib/gs_stats/gs_stats.cpp lib/gs_modbus/gs_modbus.cpp lib/gs_core/gs_core.cpp
+
+build/test_gs_log: test/native/test_gs_log.cpp lib/gs_log/gs_log.cpp lib/gs_log/gs_log.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -o $@ test/native/test_gs_log.cpp lib/gs_log/gs_log.cpp
 
 clean:
 	rm -rf build

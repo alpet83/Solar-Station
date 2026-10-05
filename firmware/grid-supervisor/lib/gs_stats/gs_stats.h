@@ -56,6 +56,7 @@ public:
     const PvStatsCfg& config() const { return cfg_; }
     void feed(const PvSample& s);                 // один свежий разобранный блок 15201
     bool pv_on() const { return have_ && on_; }
+    uint32_t event_total() const { return (uint32_t)n_ev_; }   // сколько событий создано всего (для обнаружения новых)
     size_t event_count() const { return n_ev_ < kPvEvents ? n_ev_ : kPvEvents; }
     bool event(size_t i, PvEvent& out) const;     // i = 0 — самое новое
     size_t day_count() const { return n_days_ < kPvDays ? n_days_ : kPvDays; }

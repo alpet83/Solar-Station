@@ -16,9 +16,11 @@
 #include "shell.h"
 #include "can_rx.h"
 #include "gs_trig.h"
+#include <cmath>
 #include "gs_notify.h"
 #include "notify.h"
 #include "stats.h"
+#include "sdlog.h"
 #include <ctime>
 
 #ifndef GS_REV
@@ -143,12 +145,11 @@ static size_t sniff_provider(char* out, size_t cap) {
     return n;
 }
 static void sniff_rebuild() {
-    static char tmp[sizeof g_sniff_json];
+    // JSON собирается прямо в g_sniff_json под mutex'ом (раньше был второй буфер 9 КБ — дефицит ОЗУ). Сборка быстрая (мс).
+    if (!g_sniff_mtx || !xSemaphoreTake(g_sniff_mtx, pdMS_TO_TICKS(100))) return;
     time_t tt = time(nullptr);
-    size_t n = gs::sniff_to_json(g_sn, g_trk, up_ms(), tt > 1700000000 ? (int64_t)tt : -1, 24, 24, tmp, sizeof tmp);
-    if (n && xSemaphoreTake(g_sniff_mtx, pdMS_TO_TICKS(100))) {
-        memcpy(g_sniff_json, tmp, n + 1); g_sniff_len = n; xSemaphoreGive(g_sniff_mtx);
-    }
+    g_sniff_len = gs::sniff_to_json(g_sn, g_trk, up_ms(), tt > 1700000000 ? (int64_t)tt : -1, 24, 24, g_sniff_json, sizeof g_sniff_json);
+    xSemaphoreGive(g_sniff_mtx);
 }
 
 // Ждём окно на шине. Любой чужой трафик сбрасывает ожидание; если виден валидный запрос
@@ -283,6 +284,11 @@ static void drain_triggers() {
                           gs::trig_severity_name(gs::trig_severity(tr[i].kind)), (unsigned long)tr[i].t_ms, (double)tr[i].value,
                           (unsigned long)tr[i].aux, tr[i].text);
             notify::push(gs::notify_from_trigger(tr[i], (uint32_t)millis(), epoch_now()));
+            {   // то же — в журнал событий на SD
+                char ev[120];
+                snprintf(ev, sizeof ev, "TRIG %s v=%.0f aux=0x%lx %s", gs::trig_tag(tr[i].kind), (double)tr[i].value, (unsigned long)tr[i].aux, tr[i].text);
+                sdlog::event(epoch_now(), (uint32_t)millis(), ev);
+            }
         }
         if (n < 8) break;
     }
@@ -352,13 +358,26 @@ static void gs_task(void*) {
             if (canrx::cell_snapshot(cv, seen)) cells_seen = seen; else cv = gs::kNaN;
             in.cell_min_v = cv; in.cells_seen = cells_seen;
         }
+        {   // метрики на SD: строка раз в 10 с (внутри sdlog), без карты — ничего не накапливается
+            gs::MetricsRow mr;
+            mr.pack_v = g_tel.pack_v; mr.alt_v = g_tel.pack_v_alt; mr.grid_v = g_tel.grid_v; mr.load_w = g_tel.load_w;
+            mr.chg_a = g_tel.chg_curr_a; mr.chg_w = g_tel.chg_w; mr.pv_v = g_tel.pv_v;
+            mr.pv_relay = g_tel.pv_relay; mr.relay_grid = g_tel.relay_grid; mr.ongrid_reg = g_tel.ongrid_reg;
+            gs::BatteryBrief bb; canrx::brief(bb);
+            mr.bms_v = bb.v; mr.bms_soc = bb.soc;
+            if (std::isfinite(in.cell_min_v)) mr.cell_min_mv = (int)lroundf(in.cell_min_v * 1000.0f);
+            sdlog::sample(mr, epoch_now(), (uint32_t)now_ms);
+        }
         drain_triggers();                              // обработка триггеров BMS (генерируются задачей CAN асинхронно)
         gs::Decision d;
         if (!sniff_only) {
             d = g_sv.step(in);                         // в режиме приёма ядро не шагает: команд нет
             gs::NotifyEvent nev[20];                   // 9 наблюдаемых флагов: вход и выход за один шаг — не больше 9, с запасом
             const size_t nn = sv_notify.on_flags(d.flags, d.v_used, (uint32_t)now_ms, epoch_now(), nev, 20);
-            for (size_t i = 0; i < nn; ++i) { Serial.printf("NOTE %s %s\n", nev[i].tag, nev[i].message); notify::push(nev[i]); }
+            for (size_t i = 0; i < nn; ++i) {
+                Serial.printf("NOTE %s %s\n", nev[i].tag, nev[i].message); notify::push(nev[i]);
+                char ev[120]; snprintf(ev, sizeof ev, "%s %s", nev[i].tag, nev[i].message); sdlog::event(epoch_now(), (uint32_t)now_ms, ev);
+            }
         }
 
         if (d.cmd != gs::Cmd::None) {
@@ -370,7 +389,10 @@ static void gs_task(void*) {
             events[0] = e; if (n_events < gs::kEventCap) ++n_events;
             Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
             gs::NotifyEvent cn;
-            if (gs::SupervisorNotifier::on_command(d.cmd, d.reason, ok, d.v_used, (uint32_t)now_ms, e.epoch_s, cn)) notify::push(cn);
+            if (gs::SupervisorNotifier::on_command(d.cmd, d.reason, ok, d.v_used, (uint32_t)now_ms, e.epoch_s, cn)) {
+                notify::push(cn);
+                char ev[120]; snprintf(ev, sizeof ev, "%s %s", cn.tag, cn.message); sdlog::event(epoch_now(), (uint32_t)now_ms, ev);
+            }
         }
         if (shell::serial_log()) Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d cell=%.3f flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u uart bytes=%u ferr=%u\n",
                       g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid, (double)in.cell_min_v,
@@ -454,9 +476,11 @@ void setup() {
     g_sv.set_config(shell::load_config());
     shell::begin(esp_random());
     stats::begin();      // статистика включений PV (ОЗУ)
+    sdlog::begin();      // запись логов на SD (если карты нет — ничего не делает, повтор раз в 5 мин)
     notify::begin();     // вебхук-уведомления: настройки из NVS + задача отправки (низкий приоритет)
     {
         char rs[40]; snprintf(rs, sizeof rs, "%s%s", reset_reason_name(esp_reset_reason()), g_safe_mode ? ",safe" : "");
+        { char ev[80]; snprintf(ev, sizeof ev, "BOOT rev=%s reset=%s", GS_REV, reset_reason_name(esp_reset_reason())); sdlog::event(-1, (uint32_t)millis(), ev); }
         notify::push(gs::SupervisorNotifier::boot(GS_REV, rs, (uint32_t)millis(), -1));   // время ещё не синхронизировано: уточнится при отправке
     }
     canrx::begin();      // пассивный CAN-сниффер батареи (отдельная задача, RS485 не затрагивает)

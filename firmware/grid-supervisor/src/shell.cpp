@@ -5,6 +5,7 @@
 #include "can_rx.h"
 #include "notify.h"
 #include "stats.h"
+#include "sdlog.h"
 
 #include <Preferences.h>
 #include <Update.h>
@@ -269,6 +270,49 @@ static void h_can() {
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
 }
 
+// GET /api/log — состояние SD и список файлов; GET /api/log?f=ИМЯ — содержимое файла (CSV метрик / events.log). Чтение открыто (секретов в логах нет).
+static void h_log() {
+    touch_api();
+    if (g_http.hasArg("f")) {
+        String f = g_http.arg("f");
+        if (!gs::valid_log_name(f.c_str())) { g_http.send(400, "text/plain", "bad name"); return; }
+        if (!sdlog::stream_file(g_http, f.c_str())) g_http.send(404, "text/plain", "no such file or no card");
+        return;
+    }
+    constexpr size_t kCap = 4096;     // ~60 файлов × <=45 байт + статистика; в куче на время запроса
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[kCap]);
+    size_t n = buf ? sdlog::status_json(buf.get(), kCap) : 0;
+    g_http.sendHeader("Cache-Control", "no-store");
+    if (n) g_http.send(200, "application/json", buf.get()); else g_http.send(503, "text/plain", buf ? "log: json failed" : "log: no heap");
+}
+
+// GET /api/heap — состояние кучи (диагностика утечек/фрагментации), чтение открыто.
+static void h_heap() {
+    touch_api();
+    char buf[160];
+    snprintf(buf, sizeof buf, "{\"free\":%u,\"min_free\":%u,\"max_block\":%u,\"size\":%u,\"uptime_ms\":%lu}",
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getHeapSize(), (unsigned long)millis());
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(200, "application/json", buf);
+}
+
+// POST /api/reboot — перезагрузка платы (пароль + X-GS); буферы SD сбрасываются. Эквивалент команды `reboot` в Serial.
+static void h_reboot() {
+    if (!authed(true)) return;
+    g_http.send(200, "text/plain", "rebooting");
+    delay(100);
+    sdlog::flush_now();
+    delay(300);
+    ESP.restart();
+}
+
+// POST /api/log/flush — принудительный сброс буферов SD (пароль + X-GS).
+static void h_log_flush() {
+    if (!authed(true)) return;
+    sdlog::flush_now();
+    g_http.send(200, "text/plain", "ok");
+}
+
 // GET /api/pvstats — статистика включений PV (сутки, события реле PV), чтение открыто.
 static void h_pvstats() {
     touch_api();
@@ -276,7 +320,7 @@ static void h_pvstats() {
     std::unique_ptr<char[]> buf(new (std::nothrow) char[kCap]);
     size_t n = buf ? stats::json(buf.get(), kCap) : 0;
     g_http.sendHeader("Cache-Control", "no-store");
-    g_http.send(n ? 200 : 503, "application/json", n ? buf.get() : "{}");
+    if (n) g_http.send(200, "application/json", buf.get()); else g_http.send(503, "text/plain", buf ? "pvstats: json failed" : "pvstats: no heap");
 }
 
 // GET /api/bms_events — журнал последних 16 событий BMS (изменения «знаковых» полей, ячейки, пропажа кадров), от новых к старым.
@@ -287,7 +331,7 @@ static void h_bms_events() {
     std::unique_ptr<char[]> buf(new (std::nothrow) char[kCap]);
     size_t n = buf ? canrx::events_json(buf.get(), kCap) : 0;
     g_http.sendHeader("Cache-Control", "no-store");
-    g_http.send(n ? 200 : 503, "application/json", n ? buf.get() : "{}");
+    if (n) g_http.send(200, "application/json", buf.get()); else g_http.send(503, "text/plain", buf ? "bms_events: json failed" : "bms_events: no heap");
 }
 
 // POST /api/can  [speed=0|100|125|250|500] [ack=0|1] [hb=0|1] — скорость CAN-сниффера, кбит/с (0 = выключить) и подтверждение кадров (ACK); сохраняется в NVS.
@@ -387,7 +431,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/pvstats>pvstats</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/pvstats>pvstats</a> · <a href=/api/log>log</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
@@ -409,7 +453,7 @@ static void h_update_done() {
     bool ok = g_upd_ok && !Update.hasError();
     g_http.send(ok ? 200 : 500, "text/plain", ok ? String("OK, rebooting") : String("FAILED: ") + (g_upd_err.length() ? g_upd_err : Update.errorString()));
     g_upd_auth = false; g_ota_active = false;
-    if (ok) { delay(500); ESP.restart(); }
+    if (ok) { sdlog::flush_now(); delay(500); ESP.restart(); }
 }
 
 static void upd_fail(const char* why) { g_upd_err = why; g_upd_ok = false; Update.abort(); g_ota_active = false; }
@@ -554,7 +598,7 @@ static void h_setup() {
     if (xt.length()) p.putString("xtok", xt);
     p.end();
     g_http.send(200, "text/plain", "saved, rebooting");
-    delay(500); ESP.restart();
+    sdlog::flush_now(); delay(500); ESP.restart();
 }
 
 // Удержание BOOT (GPIO0) ~3 с при включении стирает пароль администратора, Wi-Fi и токен.
@@ -839,7 +883,7 @@ static void cli_exec(const gs::CliCmd& c) {
         }
         break; }
     case CliKind::ExtToken: { Preferences p; p.begin("gs", false); p.putString("xtok", c.a); p.end(); g_xtok = c.a; Serial.println("ext token saved"); break; }
-    case CliKind::Reboot: Serial.println("rebooting"); Serial.flush(); delay(200); ESP.restart(); break;
+    case CliKind::Reboot: Serial.println("rebooting"); Serial.flush(); sdlog::flush_now(); delay(200); ESP.restart(); break;
     }
 }
 
@@ -880,6 +924,10 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/can", HTTP_POST, h_can_set);
     g_http.on("/api/bms_events", HTTP_GET, h_bms_events);
     g_http.on("/api/pvstats", HTTP_GET, h_pvstats);
+    g_http.on("/api/log", HTTP_GET, h_log);
+    g_http.on("/api/log/flush", HTTP_POST, h_log_flush);
+    g_http.on("/api/reboot", HTTP_POST, h_reboot);
+    g_http.on("/api/heap", HTTP_GET, h_heap);
     g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/api/logger", HTTP_POST, h_logger);
     g_http.on("/api/webhook", HTTP_GET, h_webhook_get);
