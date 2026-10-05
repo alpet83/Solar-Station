@@ -354,7 +354,7 @@ NotifyEvent notify_from_trigger(const Trigger& t, uint32_t now_ms, int64_t epoch
     return ev;
 }
 
-const char* reason_name(Reason r) {
+const char* notify_reason_name(Reason r) {
     switch (r) {
         case Reason::HardFloor: return "HARD_FLOOR";
         case Reason::SoftLow: return "SOFT_LOW";
@@ -427,7 +427,7 @@ bool SupervisorNotifier::on_command(Cmd cmd, Reason r, bool ok, float v, uint32_
     notify_copy(out.tag, sizeof out.tag, name);
     char vs[24] = "";
     if (std::isfinite(v)) snprintf(vs, sizeof vs, ", %.1f V", (double)v);
-    snprintf(out.message, sizeof out.message, "grid %s: reason=%s%s%s", name, reason_name(r), vs, ok ? "" : ", bus write FAILED");
+    snprintf(out.message, sizeof out.message, "grid %s: reason=%s%s%s", name, notify_reason_name(r), vs, ok ? "" : ", bus write FAILED");
     out.value = v;
     out.epoch_s = epoch_s; out.uptime_ms = uptime_ms;
     return true;

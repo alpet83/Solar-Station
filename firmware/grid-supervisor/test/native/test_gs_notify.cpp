@@ -369,7 +369,7 @@ static void test_commands_boot() {
     CHECK(!strcmp(e.message, "grid CONNECT: reason=HARD_FLOOR, 47.2 V") || !strcmp(e.message, "grid CONNECT: reason=HARD_FLOOR, 47.3 V"));
     SupervisorNotifier::on_command(Cmd::Disconnect, Reason::Charged, false, NAN, 0, -1, e);
     CHECK(!strcmp(e.message, "grid DISCONNECT: reason=CHARGED, bus write FAILED") && !std::isfinite(e.value));
-    CHECK(!strcmp(reason_name(Reason::None), "NONE"));
+    CHECK(!strcmp(notify_reason_name(Reason::None), "NONE"));
     e = SupervisorNotifier::boot("abc1234", "SW", 1500, -1);
     CHECK(e.sev == kSevInfo && !strcmp(e.tag, "BOOT") && !strcmp(e.message, "boot rev=abc1234 reset=SW") && e.uptime_ms == 1500 && e.epoch_s == -1 && !std::isfinite(e.value));
     e = SupervisorNotifier::boot("", nullptr, 0, 5); CHECK(!strcmp(e.message, "boot rev=? reset=?"));

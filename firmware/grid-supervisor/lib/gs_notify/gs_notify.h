@@ -157,7 +157,7 @@ private:
 // Триггер BMS. now_ms — текущий uptime, epoch_now_s — текущее UTC (< 0 — нет времени): время события = now - (now_ms - t.t_ms).
 NotifyEvent notify_from_trigger(const Trigger& t, uint32_t now_ms, int64_t epoch_now_s);
 
-const char* reason_name(Reason r);                // HARD_FLOOR, SOFT_LOW, NO_DATA, CHARGED, SAFE_MODE, MANUAL, NONE
+const char* notify_reason_name(Reason r);                // HARD_FLOOR, SOFT_LOW, NO_DATA, CHARGED, SAFE_MODE, MANUAL, NONE
 
 // События супервизора. Состояние — флаги предыдущего шага (по фронту: вход -> событие, выход -> info <TAG>_OK).
 class SupervisorNotifier {
