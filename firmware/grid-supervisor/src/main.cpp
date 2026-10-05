@@ -16,8 +16,13 @@
 #include "shell.h"
 #include "can_rx.h"
 #include "gs_trig.h"
+#include "gs_notify.h"
+#include "notify.h"
 #include <ctime>
 
+#ifndef GS_REV
+#define GS_REV "dev"
+#endif
 #ifndef GS_RS485_RX
 #define GS_RS485_RX 21
 #endif
@@ -264,11 +269,11 @@ static void poll_slow() {
     next = millis() + (all ? 300000u : 30000u);
 }
 
-// Слой «обработки» триггеров BMS (генерация — в can_rx.cpp по кадрам). Слабая заглушка: следующий слайс подключит сюда HTTP-вебхук
-// (переопределить функцию в другом файле или заменить тело).
-void __attribute__((weak)) notify_hook(const gs::Trigger& t) { (void)t; }
+static int64_t epoch_now() { time_t tt = time(nullptr); return tt > 1700000000 ? (int64_t)tt : -1; }
 
-// Выгребает очередь триггеров раз в итерацию цикла управления: печать в Serial + хук уведомления.
+// Слой «обработки» триггеров BMS (генерация — в can_rx.cpp по кадрам). Единственный владелец уведомлений — notify (src/notify.cpp):
+// push() не блокирует цикл управления (mutex с таймаутом 0), отправка — в отдельной задаче.
+// Выгребает очередь триггеров раз в итерацию цикла управления: печать в Serial + уведомление.
 static void drain_triggers() {
     gs::Trigger tr[8];
     for (size_t n; (n = canrx::drain_triggers(tr, 8)) > 0;) {
@@ -276,9 +281,26 @@ static void drain_triggers() {
             Serial.printf("TRIG #%lu %s sev=%s t=%lu v=%.0f aux=0x%lx %s\n", (unsigned long)tr[i].id, gs::trig_tag(tr[i].kind),
                           gs::trig_severity_name(gs::trig_severity(tr[i].kind)), (unsigned long)tr[i].t_ms, (double)tr[i].value,
                           (unsigned long)tr[i].aux, tr[i].text);
-            notify_hook(tr[i]);
+            notify::push(gs::notify_from_trigger(tr[i], (uint32_t)millis(), epoch_now()));
         }
         if (n < 8) break;
+    }
+}
+
+// Причина сброса для события BOOT.
+static const char* reset_reason_name(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXT";
+        case ESP_RST_SW: return "SW";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNKNOWN";
     }
 }
 
@@ -290,6 +312,7 @@ static void gs_task(void*) {
     uint32_t seq = 0, ev_id = 0;
     bool cells_seen = false;                       // последнее известное значение (если mutex CAN не взят)
     gs::Event events[gs::kEventCap]; size_t n_events = 0;
+    gs::SupervisorNotifier sv_notify;              // фронты флагов ядра -> уведомления
     for (;;) {
         esp_task_wdt_reset();
         if ((int32_t)(millis() - next) < 0) { bus_listen(); delay(2); continue; }
@@ -323,7 +346,12 @@ static void gs_task(void*) {
         }
         drain_triggers();                              // обработка триггеров BMS (генерируются задачей CAN асинхронно)
         gs::Decision d;
-        if (!sniff_only) d = g_sv.step(in);            // в режиме приёма ядро не шагает: команд нет
+        if (!sniff_only) {
+            d = g_sv.step(in);                         // в режиме приёма ядро не шагает: команд нет
+            gs::NotifyEvent nev[20];                   // 9 наблюдаемых флагов: вход и выход за один шаг — не больше 9, с запасом
+            const size_t nn = sv_notify.on_flags(d.flags, d.v_used, (uint32_t)now_ms, epoch_now(), nev, 20);
+            for (size_t i = 0; i < nn; ++i) { Serial.printf("NOTE %s %s\n", nev[i].tag, nev[i].message); notify::push(nev[i]); }
+        }
 
         if (d.cmd != gs::Cmd::None) {
             // во время OTA (стирание flash блокирует кэш и UART ISR) на шину не передаём: ядро повторит команду
@@ -333,6 +361,8 @@ static void gs_task(void*) {
             for (size_t i = gs::kEventCap - 1; i > 0; --i) events[i] = events[i - 1];
             events[0] = e; if (n_events < gs::kEventCap) ++n_events;
             Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
+            gs::NotifyEvent cn;
+            if (gs::SupervisorNotifier::on_command(d.cmd, d.reason, ok, d.v_used, (uint32_t)now_ms, e.epoch_s, cn)) notify::push(cn);
         }
         if (shell::serial_log()) Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d cell=%.3f flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u uart bytes=%u ferr=%u\n",
                       g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid, (double)in.cell_min_v,
@@ -415,6 +445,11 @@ void setup() {
 
     g_sv.set_config(shell::load_config());
     shell::begin(esp_random());
+    notify::begin();     // вебхук-уведомления: настройки из NVS + задача отправки (низкий приоритет)
+    {
+        char rs[40]; snprintf(rs, sizeof rs, "%s%s", reset_reason_name(esp_reset_reason()), g_safe_mode ? ",safe" : "");
+        notify::push(gs::SupervisorNotifier::boot(GS_REV, rs, (uint32_t)millis(), -1));   // время ещё не синхронизировано: уточнится при отправке
+    }
     canrx::begin();      // пассивный CAN-сниффер батареи (отдельная задача, RS485 не затрагивает)
     canrx::set_watch_cfg(gs::make_watch_cfg(g_sv.config()));   // пороги триггеров ячеек из конфигурации
     Serial.printf("gs boot: reset=%d short_boots=%u safe=%d\n", (int)esp_reset_reason(), (unsigned)rtc_short_boots, g_safe_mode);

@@ -6,7 +6,7 @@
 //     чтобы поймать «кадры пропали»). Сравнивает снимок BmsSnapshot с предыдущим состоянием и кладёт
 //     в TriggerQueue события ПО ПЕРЕХОДАМ, а не по каждому кадру.
 //   * ОБРАБОТКА: цикл управления раз в итерацию выгребает очередь (pop) и делает с триггерами что нужно
-//     (сейчас — печать в Serial; дальше — вебхук). Очередь и журнал не потокобезопасны сами по себе:
+//     (печать в Serial и notify::push — вебхук, см. lib/gs_notify). Очередь и журнал не потокобезопасны сами по себе:
 //     владелец (src/can_rx.cpp) защищает их своим mutex'ом.
 #pragma once
 #include <cstddef>
@@ -111,7 +111,7 @@ struct WatchCfg {
 // Пороги ячеек берутся из Config (В -> мВ с округлением): warn = cell_soft_on_v, hard = cell_hard_floor_v.
 WatchCfg make_watch_cfg(const Config& cfg);
 
-// Снимок из трёх декодеров. Слоты watch[]: 0 f312, 1 f320, 2 f319 (байт 0 и индексы), 3 f322 (байты 4–7), 4 f311 (байты 6–7)
+// Снимок из трёх декодеров. Слоты watch[]: 0 f312, 1 f320, 2 f319 (байт 0 и индексы), 3 f322 (байты 4–5; байты 6–7 повторяют SOC — шум), 4 f311 (байты 6–7)
 // — seplos_500k; 5 a200 (prot_raw 0x00030200) — seplos_100k; 6 p359 (prot1,prot2,alarm1,alarm2), 7 p35c (req.raw) — Pylon.
 // Шумные поля (ток, напряжения, температуры, ёмкость, счётчик 0x314) НЕ наблюдаются.
 BmsSnapshot make_bms_snapshot(const PylonBattery& b, const SeplosBattery& s, const Seplos500Battery& s5, uint32_t now_ms);

@@ -114,6 +114,70 @@ static void test_can() {
     CHECK(is_err(cli_parse("can \"500\"", 4)));
 }
 
+static void test_webhook() {
+    CliCmd c = cli_parse("webhook", 4);
+    CHECK(c.kind == CliKind::Webhook && c.flag == 0);
+    CHECK(cli_parse("WEBHOOK status", 4).flag == 0 && cli_parse("  webhook   ", 4).flag == 0);
+    CHECK(cli_parse("webhook test", 4).kind == CliKind::Webhook && cli_parse("webhook test", 4).flag == 2);
+    c = cli_parse("webhook on", 4);
+    CHECK(c.kind == CliKind::Webhook && c.flag == 1 && !strcmp(c.a, "en") && !strcmp(c.text, "1"));
+    c = cli_parse("webhook OFF", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "en") && !strcmp(c.text, "0"));
+    CHECK(is_err(cli_parse("webhook on now", 4)) && is_err(cli_parse("webhook test 1", 4)));
+    // URL: остаток строки как есть, длиннее токена (80), с ${...} и '#'
+    std::string url = "https://api.telegram.org/bot123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/sendMessage?chat_id=-100&text=${host_name}%20${event_tag}:%20${event_message}#x";
+    CHECK(url.size() > 80);
+    c = cli_parse(("webhook url " + url).c_str(), 4);
+    CHECK(c.kind == CliKind::Webhook && c.flag == 1 && !strcmp(c.a, "url") && url == c.text);
+    c = cli_parse(("webhook   url \t" + url + "   ").c_str(), 4);                // лишние пробелы вокруг
+    CHECK(c.flag == 1 && url == c.text);
+    c = cli_parse(("webhook url \"" + url + "\"").c_str(), 4);
+    CHECK(c.flag == 1 && url == c.text);
+    CHECK(is_err(cli_parse("webhook url", 4)));                                  // значение обязательно
+    CHECK(is_err(cli_parse("webhook url \"http://x", 4)));                       // не закрыта кавычка
+    CHECK(is_err(cli_parse("webhook url \"http://x\" tail", 4)));
+    c = cli_parse("webhook url \"\"", 4);                                        // очистка
+    CHECK(c.flag == 1 && !strcmp(c.a, "url") && c.text[0] == 0);
+    // тело: пробелы сохраняются, кавычки внутри — экранированием
+    c = cli_parse("webhook body chat_id=1&text=${host_name} ${event_message}", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "body") && !strcmp(c.text, "chat_id=1&text=${host_name} ${event_message}"));
+    c = cli_parse("webhook body \"{\\\"a\\\": \\\"b\\\\c\\\"}\"", 4);
+    CHECK(c.flag == 1 && !strcmp(c.text, "{\"a\": \"b\\c\"}"));
+    c = cli_parse("webhook body {\"text\":\"x\"}", 4);                          // без кавычек в начале — как есть
+    CHECK(c.flag == 1 && !strcmp(c.text, "{\"text\":\"x\"}"));
+    c = cli_parse("webhook ctype application/json; charset=utf-8", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "ctype") && !strcmp(c.text, "application/json; charset=utf-8"));
+    c = cli_parse("webhook err #ERROR", 4);                                      // # не в начале строки — не комментарий
+    CHECK(c.flag == 1 && !strcmp(c.a, "err") && !strcmp(c.text, "#ERROR"));
+    CHECK(cli_parse("webhook err \"\"", 4).text[0] == 0);
+    std::string max(400, 'u'), over(401, 'u');
+    CHECK(cli_parse(("webhook body " + max).c_str(), 4).flag == 1);
+    CHECK(is_err(cli_parse(("webhook body " + over).c_str(), 4)));
+    CHECK(is_err(cli_parse(("webhook body \"" + over + "\"").c_str(), 4)));
+    c = cli_parse("webhook method POST", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "method") && !strcmp(c.text, "POST"));
+    CHECK(!strcmp(cli_parse("webhook method get", 4).text, "GET"));
+    CHECK(is_err(cli_parse("webhook method put", 4)) && is_err(cli_parse("webhook method", 4)) && is_err(cli_parse("webhook method get post", 4)));
+    c = cli_parse("webhook timeout 25", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "tmo") && !strcmp(c.text, "25"));
+    CHECK(cli_parse("webhook timeout 1", 4).flag == 1 && cli_parse("webhook timeout 60", 4).flag == 1);
+    CHECK(is_err(cli_parse("webhook timeout 0", 4)) && is_err(cli_parse("webhook timeout 61", 4)) && is_err(cli_parse("webhook timeout x", 4)) && is_err(cli_parse("webhook timeout", 4)));
+    c = cli_parse("webhook min ALERT", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "min") && !strcmp(c.text, "alert"));
+    CHECK(!strcmp(cli_parse("webhook min info", 4).text, "info") && !strcmp(cli_parse("webhook min warn", 4).text, "warn"));
+    CHECK(is_err(cli_parse("webhook min high", 4)) && is_err(cli_parse("webhook min", 4)) && is_err(cli_parse("webhook min 1", 4)));
+    c = cli_parse("webhook insecure off", 4);
+    CHECK(c.flag == 1 && !strcmp(c.a, "insecure") && !strcmp(c.text, "0") && !strcmp(cli_parse("webhook insecure on", 4).text, "1"));
+    CHECK(is_err(cli_parse("webhook insecure maybe", 4)));
+    CHECK(is_err(cli_parse("webhook frob", 4)) && is_err(cli_parse("webhook frob 1", 4)));
+    CHECK(cli_parse("webhookx", 4).kind == CliKind::Error);                       // другое слово
+    CHECK(cli_parse("# webhook on", 4).kind == CliKind::None);
+    // строка вплоть до 1000 символов проходит сборщик строк целиком
+    CliLine l; std::string long_line = "webhook url " + std::string(500, 'a') + "\n"; bool got = false;
+    for (char ch : long_line) if (l.feed(ch)) got = true;
+    CHECK(got && !l.overflowed() && strlen(l.line()) == 512);
+}
+
 static void test_line() {
     CliLine l;
     auto feed_all = [&](const char* s, std::string& out) {
@@ -129,7 +193,7 @@ static void test_line() {
     CHECK(out == "ac");
     feed_all("a\nb\n", out);
     CHECK(out == "b");
-    std::string big(400, 'x');
+    std::string big(1100, 'x');
     big += "\n";
     bool got = false, over = false;
     for (char ch : big) { if (l.feed(ch)) got = true; if (l.overflowed()) over = true; }
@@ -148,9 +212,10 @@ static void test_sniff_policy() {
 }
 
 int main() {
-    test_simple(); test_net(); test_new(); test_can(); test_other(); test_line(); test_sniff_policy();
+    test_simple(); test_net(); test_new(); test_can(); test_other(); test_line(); test_webhook(); test_sniff_policy();
     CHECK(strstr(cli_help_text(), "net <1..4>") != nullptr);
     CHECK(strstr(cli_help_text(), "can [off|100|125|250|500]") != nullptr);
+    CHECK(strstr(cli_help_text(), "webhook test") != nullptr);
     printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;
 }

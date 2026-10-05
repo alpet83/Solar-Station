@@ -1,6 +1,7 @@
 #include "shell.h"
 #include "gs_cli.h"
 #include "can_rx.h"
+#include "notify.h"
 
 #include <Preferences.h>
 #include <Update.h>
@@ -287,6 +288,40 @@ static void h_can_set() {
     g_http.send(200, "text/plain", "ok");
 }
 
+// GET /api/webhook — состояние вебхука БЕЗ секретов (хост из URL без пути/query, статистика, последний результат): чтение открыто.
+static void h_webhook_get() {
+    touch_api();
+    static char buf[640];
+    size_t n = notify::status_json(buf, sizeof buf);
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
+}
+
+// POST /api/webhook  url=.. method=get|post body=.. ctype=.. err=.. tmo=1..60 min=info|warn|alert insecure=0|1 en=0|1  (любое подмножество).
+// Под паролем + X-GS. Набор применяется атомарно; неизвестный плейсхолдер и прочие ошибки -> 400 с текстом (в нём есть имя плейсхолдера).
+static void h_webhook_set() {
+    if (!authed(true)) return;
+    touch_api();
+    const char* keys[gs::kWebhookKeyCount]; String vals[gs::kWebhookKeyCount]; const char* vp[gs::kWebhookKeyCount]; size_t n = 0;
+    for (size_t i = 0; i < gs::kWebhookKeyCount; ++i) {
+        if (!g_http.hasArg(gs::kWebhookKeys[i])) continue;
+        keys[n] = gs::kWebhookKeys[i]; vals[n] = g_http.arg(gs::kWebhookKeys[i]); vp[n] = vals[n].c_str(); ++n;
+    }
+    if (!n) { g_http.send(400, "text/plain", "nothing to set (url method body ctype err tmo min insecure en)"); return; }
+    char err[120];
+    if (!notify::set_many(keys, vp, n, err, sizeof err)) { g_http.send(400, "text/plain", err); return; }
+    g_http.send(200, "text/plain", "ok");
+}
+
+// POST /api/webhook/test — ставит в очередь событие TEST (обходит фильтр серьёзности и подавление); результат — в GET /api/webhook.
+static void h_webhook_test() {
+    if (!authed(true)) return;
+    touch_api();
+    char err[80];
+    if (!notify::test(err, sizeof err)) { g_http.send(409, "text/plain", err); return; }
+    g_http.send(200, "text/plain", "queued");
+}
+
 // POST /api/logger  period_s=30..900 — ожидаемый период пачек даталоггера (сбрасывает захват ритма).
 static void h_logger() {
     if (!authed(true)) return;
@@ -338,7 +373,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
@@ -412,6 +447,29 @@ static String esc(const String& in) {
     return o;
 }
 
+// Поля вебхука на /setup. Только под паролем администратора (URL может содержать токен бота): пустое поле = очистить.
+static String webhook_form() {
+    static gs::WebhookCfg c; c = notify::config();       // static: не раздуваем стек задачи оболочки
+    auto sel = [](const char* name, const char* cur, std::initializer_list<const char*> opts) {
+        String o = String("<select name=") + name + ">";
+        for (const char* v : opts) { o += String("<option") + (!strcmp(v, cur) ? " selected" : "") + ">" + v + "</option>"; }
+        return o + "</select>";
+    };
+    String f = "<p><b>Webhook notifications</b> (any http/https service, e.g. a Telegram bot; see README). Placeholders in URL/body: "
+               "${host_name} ${event_message} ${event_value} ${event_tag} ${event_flags} ${event_time}; values are URL-encoded. Empty field = clear.<br>"
+               "<input type=hidden name=wh_form value=1>"
+               "URL <input name=wh_url value=\"" + esc(c.url) + "\" size=70 maxlength=255><br>"
+               "Method " + sel("wh_method", c.method, {"GET", "POST"}) +
+               " Content-Type (POST) <input name=wh_ctype value=\"" + esc(c.ctype) + "\" maxlength=64><br>"
+               "Body (POST) <input name=wh_body value=\"" + esc(c.body) + "\" size=70 maxlength=400><br>"
+               "Failure text in response <input name=wh_err value=\"" + esc(c.err) + "\" maxlength=48> "
+               "Timeout, s <input name=wh_tmo type=number min=1 max=60 value=" + String((int)c.timeout_s) + " style=\"width:4em\"><br>"
+               "Min severity " + sel("wh_min", gs::notify_sev_name(c.min_sev), {"info", "warn", "alert"}) +
+               " <label><input type=checkbox name=wh_insecure value=1" + (c.insecure ? " checked" : "") + "> https without certificate check</label> "
+               "<label><input type=checkbox name=wh_en value=1" + (c.enabled ? " checked" : "") + "> enabled</label></p>";
+    return f;
+}
+
 static void h_setup() {
     bool open_setup = g_http_pass.length() == 0;
     if (!open_setup && !basic_ok()) { g_http.requestAuthentication(); return; }
@@ -432,8 +490,10 @@ static void h_setup() {
         page += "<p>Hostname <input name=host value=\"" + esc(host) + "\" maxlength=32><br>"
                 "Admin password (&gt;= 8" + String(open_setup ? ", required" : ", empty = keep") + ") <input name=hpass type=password><br>"
                 "Setup AP password (&gt;= 8, empty = keep) <input name=appass type=password><br>"
-                "Ext token for Pi (&gt;= 16, empty = keep) <input name=xtok type=password></p>"
-                "<input type=submit value=\"Save and reboot\"></form>";
+                "Ext token for Pi (&gt;= 16, empty = keep) <input name=xtok type=password></p>";
+        if (open_setup) page += "<p>Webhook notifications: set the admin password first, then open /setup again (the URL may contain a bot token).</p>";
+        else page += webhook_form();
+        page += "<input type=submit value=\"Save and reboot\"></form>";
         g_http.send(200, "text/html", page);
         return;
     }
@@ -451,6 +511,17 @@ static void h_setup() {
     for (size_t k = 0; k < host.length(); ++k) {
         char c = host[k];
         if (!(isalnum((unsigned char)c) || c == '-')) { g_http.send(400, "text/plain", "hostname: letters, digits, '-' only"); return; }
+    }
+    if (!open_setup && g_http.hasArg("wh_form")) {       // вебхук: проверяем ДО записи остального (400 — ничего не сохранено)
+        String url = g_http.arg("wh_url");
+        const char* keys[gs::kWebhookKeyCount] = {"url", "method", "body", "ctype", "err", "tmo", "min", "insecure", "en"};
+        String vals[gs::kWebhookKeyCount] = {url, g_http.arg("wh_method"), g_http.arg("wh_body"), g_http.arg("wh_ctype"), g_http.arg("wh_err"),
+                                             g_http.arg("wh_tmo"), g_http.arg("wh_min"), g_http.hasArg("wh_insecure") ? "1" : "0",
+                                             (g_http.hasArg("wh_en") && url.length()) ? "1" : "0"};
+        const char* vp[gs::kWebhookKeyCount];
+        for (size_t i = 0; i < gs::kWebhookKeyCount; ++i) vp[i] = vals[i].c_str();
+        char werr[120];
+        if (!notify::set_many(keys, vp, gs::kWebhookKeyCount, werr, sizeof werr)) { g_http.send(400, "text/plain", String("webhook: ") + werr); return; }
     }
     Preferences p; p.begin("gs", false);
     for (int k = 0; k < kNets; ++k) {
@@ -619,6 +690,33 @@ static void nets_reload_apply(int k, bool deleted) {     // сети измен�
     else if (k == g_net_cur) { if (deleted) next_net(); else begin_net(k); }
 }
 
+// Строка статуса вебхука: секреты (путь и query URL, тело) не печатаем — только схема+хост и длины.
+static void webhook_status() {
+    static notify::Status s;
+    if (!notify::status(s)) { Serial.println("webhook: busy, retry"); return; }
+    char org[100]; gs::url_origin(s.cfg.url, org, sizeof org);
+    Serial.printf("webhook: %s, %s %s, min=%s, timeout=%u s, insecure=%s\n", s.cfg.enabled ? "ON" : "off", s.cfg.method, org[0] ? org : "(url not set)",
+                  gs::notify_sev_name(s.cfg.min_sev), (unsigned)s.cfg.timeout_s, s.cfg.insecure ? "on" : "off");
+    Serial.printf("  url %s (%u chars), body %s, ctype '%s', err text '%s'\n", s.cfg.url[0] ? "set" : "empty", (unsigned)strlen(s.cfg.url),
+                  s.cfg.body[0] ? (String("set, ") + strlen(s.cfg.body) + " chars").c_str() : "empty", s.cfg.ctype, s.cfg.err);
+    Serial.printf("  queue=%u sent=%lu failed=%lu dropped=%lu suppressed=%lu filtered=%lu\n", (unsigned)s.queue_len, (unsigned long)s.st.sent, (unsigned long)s.st.failed,
+                  (unsigned long)s.st.dropped, (unsigned long)s.st.suppressed, (unsigned long)s.st.filtered);
+    if (s.st.have_last) Serial.printf("  last: %s http=%d %s, %lu s ago\n", s.st.last_ok ? "ok" : "FAIL", s.st.last_http, s.st.last_error, (unsigned long)((uint32_t)(s.now_ms - s.st.last_ms) / 1000));
+    else Serial.println("  last: no attempts yet");
+}
+
+static void webhook_cmd(const gs::CliCmd& c) {
+    char err[120];
+    if (c.flag == 0) { webhook_status(); return; }
+    if (c.flag == 2) {
+        if (notify::test(err, sizeof err)) Serial.println("webhook: TEST queued (sent when Wi-Fi is up); result: 'webhook'");
+        else Serial.printf("error: %s\n", err);
+        return;
+    }
+    if (!notify::set(c.a, c.text, err, sizeof err)) { Serial.printf("error: %s\n", err); return; }
+    Serial.printf("webhook %s saved\n", strcmp(c.a, "en") ? c.a : (c.text[0] == '1' ? "on" : "off"));   // значение не печатаем: в нём могут быть секреты
+}
+
 static void cli_exec(const gs::CliCmd& c) {
     using gs::CliKind;
     switch (c.kind) {
@@ -627,6 +725,7 @@ static void cli_exec(const gs::CliCmd& c) {
     case CliKind::Help: Serial.print(gs::cli_help_text()); break;
     case CliKind::Status: Serial.println(net_status_line(true)); Serial.printf("rev %s, mode %s, uptime %lu s\n", kRev, g_sniff_only.load() ? "sniff" : "normal", (unsigned long)(now_ms() / 1000));
         { char cb[160]; canrx::status_line(cb, sizeof cb); Serial.println(cb); }
+        webhook_status();
         break;
     case CliKind::Nets:
         for (int k = 0; k < kNets; ++k) {
@@ -652,7 +751,8 @@ static void cli_exec(const gs::CliCmd& c) {
         Serial.printf("net %d removed\n", c.net);
         nets_reload_apply(k, true);
         break; }
-    case CliKind::Host: { Preferences p; p.begin("gs", false); p.putString("host", c.a); p.end(); Serial.println("hostname saved, applies after reboot"); break; }
+    case CliKind::Host: { Preferences p; p.begin("gs", false); p.putString("host", c.a); p.end(); notify::reload_host(); Serial.println("hostname saved, applies after reboot (webhook ${host_name} now)"); break; }
+    case CliKind::Webhook: webhook_cmd(c); break;
     case CliKind::ApPass: { Preferences p; p.begin("gs", false); p.putString("appass", c.a); p.end(); Serial.println("AP password saved, applies at next AP start"); break; }
     case CliKind::AdminPass: { Preferences p; p.begin("gs", false); p.putString("hpass", c.a); p.end(); g_http_pass = c.a; Serial.println("admin password saved"); break; }
     case CliKind::Mode:
@@ -709,6 +809,20 @@ static void cli_exec(const gs::CliCmd& c) {
         Serial.printf("mode %s\n", g_sniff_only.load() ? "sniff" : "normal");
         if (canrx::speed()) Serial.printf("can %d\n", canrx::speed()); else Serial.println("can off");
         p.end();
+        {   // вебхук (в URL/теле могут быть токены — как и пароли выше, вывод export секретный)
+            static gs::WebhookCfg w; w = notify::config();
+            if (w.url[0]) {
+                Serial.printf("webhook url %s\n", q(w.url).c_str());
+                Serial.printf("webhook method %s\n", w.method);
+                if (w.body[0]) Serial.printf("webhook body %s\n", q(w.body).c_str());
+                if (strcmp(w.ctype, gs::kDefaultCtype)) Serial.printf("webhook ctype %s\n", q(w.ctype).c_str());
+                if (w.err[0]) Serial.printf("webhook err %s\n", q(w.err).c_str());
+                Serial.printf("webhook timeout %u\n", (unsigned)w.timeout_s);
+                Serial.printf("webhook min %s\n", gs::notify_sev_name(w.min_sev));
+                Serial.printf("webhook insecure %s\n", w.insecure ? "on" : "off");
+                if (w.enabled) Serial.println("webhook on");
+            }
+        }
         break; }
     case CliKind::ExtToken: { Preferences p; p.begin("gs", false); p.putString("xtok", c.a); p.end(); g_xtok = c.a; Serial.println("ext token saved"); break; }
     case CliKind::Reboot: Serial.println("rebooting"); Serial.flush(); delay(200); ESP.restart(); break;
@@ -753,6 +867,9 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/bms_events", HTTP_GET, h_bms_events);
     g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/api/logger", HTTP_POST, h_logger);
+    g_http.on("/api/webhook", HTTP_GET, h_webhook_get);
+    g_http.on("/api/webhook", HTTP_POST, h_webhook_set);
+    g_http.on("/api/webhook/test", HTTP_POST, h_webhook_test);
     g_http.on("/setup", HTTP_ANY, h_setup);
     g_http.on("/update", HTTP_GET, h_update_form);
     g_http.on("/update", HTTP_POST, h_update_done, h_update_upload);

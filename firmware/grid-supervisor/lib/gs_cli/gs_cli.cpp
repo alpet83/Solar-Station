@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 
 namespace gs {
 
@@ -62,6 +63,91 @@ CliCmd fail(const char* msg) {
     return c;
 }
 
+const size_t kWhValueMax = 400;
+
+// Остаток строки как значение: "в кавычках" (с \" и \\) или как есть до конца строки (хвостовые пробелы отброшены).
+// 0 — ок, иначе текст ошибки через msg.
+bool parse_rest_value(const char* p, char* out, const char*& msg) {
+    while (*p == ' ' || *p == '\t') ++p;
+    size_t k = 0;
+    if (*p == '"') {
+        ++p;
+        for (;;) {
+            if (!*p) { msg = "unterminated quote"; return false; }
+            if (*p == '"') { ++p; break; }
+            if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) ++p;
+            if (k >= kWhValueMax) { msg = "value too long (max 400)"; return false; }
+            out[k++] = *p++;
+        }
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p) { msg = "unexpected text after closing quote"; return false; }
+    } else {
+        size_t n = strlen(p);
+        while (n && (p[n - 1] == ' ' || p[n - 1] == '\t')) --n;
+        if (n > kWhValueMax) { msg = "value too long (max 400)"; return false; }
+        memcpy(out, p, n); k = n;
+    }
+    out[k] = 0;
+    return true;
+}
+
+// p — строка после слова "webhook".
+CliCmd parse_webhook(const char* p) {
+    CliCmd c; c.kind = CliKind::Webhook;
+    static const char* usage = "usage: webhook [url <u>|method get|post|body <t>|ctype <t>|err <s>|timeout <1..60>|min info|warn|alert|insecure on|off|on|off|test]";
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!*p) { c.flag = 0; return c; }
+    char sub[16]; size_t k = 0;
+    while (*p && *p != ' ' && *p != '\t') { if (k + 1 >= sizeof sub) return fail(usage); sub[k++] = *p++; }
+    sub[k] = 0;
+    const char* rest = p;
+    while (*rest == ' ' || *rest == '\t') ++rest;
+    if (ieq(sub, "status") || ieq(sub, "test") || ieq(sub, "on") || ieq(sub, "off")) {
+        if (*rest) return fail(usage);
+        if (ieq(sub, "test")) { c.flag = 2; return c; }
+        if (ieq(sub, "status")) { c.flag = 0; return c; }
+        c.flag = 1; strcpy(c.a, "en"); strcpy(c.text, ieq(sub, "on") ? "1" : "0"); return c;
+    }
+    const char* key = nullptr;
+    if (ieq(sub, "url")) key = "url";
+    else if (ieq(sub, "body")) key = "body";
+    else if (ieq(sub, "ctype")) key = "ctype";
+    else if (ieq(sub, "err")) key = "err";
+    if (key) {
+        if (!*rest) return fail("value required (use \"\" to clear)");
+        const char* msg = "";
+        if (!parse_rest_value(rest, c.text, msg)) return fail(msg);
+        c.flag = 1; strcpy(c.a, key);
+        return c;
+    }
+    // однословные значения
+    char v[40]; size_t n = 0;
+    while (rest[n] && rest[n] != ' ' && rest[n] != '\t') { if (n + 1 >= sizeof v) return fail(usage); v[n] = rest[n]; ++n; }
+    v[n] = 0;
+    const char* after = rest + n;
+    while (*after == ' ' || *after == '\t') ++after;
+    if (!n || *after) return fail(usage);
+    c.flag = 1;
+    if (ieq(sub, "method")) {
+        if (!ieq(v, "get") && !ieq(v, "post")) return fail("method must be get or post");
+        strcpy(c.a, "method"); strcpy(c.text, ieq(v, "post") ? "POST" : "GET"); return c;
+    }
+    if (ieq(sub, "timeout") || ieq(sub, "tmo")) {
+        long t = 0;
+        if (!to_long(v, t) || t < 1 || t > 60) return fail("timeout must be 1..60 seconds");
+        strcpy(c.a, "tmo"); strcpy(c.text, v); return c;
+    }
+    if (ieq(sub, "min")) {
+        if (!ieq(v, "info") && !ieq(v, "warn") && !ieq(v, "alert")) return fail("min must be info, warn or alert");
+        strcpy(c.a, "min"); for (size_t i = 0; v[i]; ++i) c.text[i] = (char)tolower((unsigned char)v[i]); return c;
+    }
+    if (ieq(sub, "insecure")) {
+        if (!ieq(v, "on") && !ieq(v, "off")) return fail("insecure must be on or off");
+        strcpy(c.a, "insecure"); strcpy(c.text, ieq(v, "on") ? "1" : "0"); return c;
+    }
+    return fail(usage);
+}
+
 bool valid_pass(const char* s) { size_t n = strlen(s); return n >= 8 && n <= 63; }
 
 }  // namespace
@@ -71,6 +157,11 @@ CliCmd cli_parse(const char* line, int max_nets) {
         const char* q = line;
         while (*q == ' ' || *q == '\t') ++q;
         if (*q == '#') return CliCmd();
+    }
+    {   // webhook: значения длиннее токена и с пробелами — разбираем остаток строки целиком
+        const char* q = line;
+        while (*q == ' ' || *q == '\t') ++q;
+        if (!strncasecmp(q, "webhook", 7) && (q[7] == 0 || q[7] == ' ' || q[7] == '\t')) return parse_webhook(q + 7);
     }
     Tok t[kMaxTok]; int n = 0;
     int r = tokenize(line, t, n);
@@ -187,6 +278,17 @@ const char* cli_help_text() {
         "  logger <30..900>            expected cloud logger period, seconds\n"
         "  log [on|off]                periodic telemetry line on this console\n"
         "  can [off|100|125|250|500]         show / set CAN sniffer (listen-only) speed, kbit/s (saved)\n"
+        "  webhook                     webhook notifications: status (URL secrets are not shown)\n"
+        "  webhook url <url>           http(s) URL template; ${host_name} ${event_message} ${event_value} ${event_tag} ${event_flags} ${event_time}\n"
+        "  webhook method get|post     request method (default get)\n"
+        "  webhook body <template>     POST body template (values are URL-encoded); \"\" clears\n"
+        "  webhook ctype <type>        POST Content-Type (default application/x-www-form-urlencoded)\n"
+        "  webhook err <text>          response containing this text counts as a failure; \"\" clears\n"
+        "  webhook timeout <1..60>     request timeout, seconds (default 10)\n"
+        "  webhook min info|warn|alert minimum severity to send (default warn)\n"
+        "  webhook insecure on|off     https without certificate check (default on)\n"
+        "  webhook on|off              enable / disable\n"
+        "  webhook test                queue a TEST event (always sent)\n"
         "  reboot\n";
 }
 

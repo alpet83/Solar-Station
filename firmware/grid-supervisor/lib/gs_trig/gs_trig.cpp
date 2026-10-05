@@ -127,7 +127,7 @@ BmsSnapshot make_bms_snapshot(const PylonBattery& b, const SeplosBattery& s, con
     if (can_fresh(s5.flags.have, s5.flags.t_ms, now)) set_field(r, 0, "f312", s5.flags.raw, 8);
     if (can_fresh(s5.unk320.have, s5.unk320.t_ms, now)) set_field(r, 1, "f320", s5.unk320.raw, 8);
     if (can_fresh(s5.mm.have, s5.mm.t_ms, now)) { const uint8_t d[3] = {s5.mm.b0, s5.mm.idx[0], s5.mm.idx[1]}; set_field(r, 2, "f319", d, 3); }
-    if (can_fresh(s5.temps.have, s5.temps.t_ms, now)) set_field(r, 3, "f322", s5.temps.unk, 4);
+    if (can_fresh(s5.temps.have, s5.temps.t_ms, now)) set_field(r, 3, "f322", s5.temps.unk, 2);   // только байты 4–5; байты 6–7 повторяют SOC (шум)
     if (can_fresh(s5.limits.have, s5.limits.t_ms, now)) { const uint8_t d[2] = {(uint8_t)(s5.limits.unk >> 8), (uint8_t)s5.limits.unk}; set_field(r, 4, "f311", d, 2); }
     // 100 кбит/с
     if (can_fresh(s.prot.have, s.prot.t_ms, now)) set_field(r, 5, "a200", s.prot.raw, 8);
