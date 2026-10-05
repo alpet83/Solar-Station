@@ -15,6 +15,7 @@
 #include "gs_modbus.h"
 #include "shell.h"
 #include "can_rx.h"
+#include "gs_trig.h"
 #include <ctime>
 
 #ifndef GS_RS485_RX
@@ -263,12 +264,31 @@ static void poll_slow() {
     next = millis() + (all ? 300000u : 30000u);
 }
 
+// Слой «обработки» триггеров BMS (генерация — в can_rx.cpp по кадрам). Слабая заглушка: следующий слайс подключит сюда HTTP-вебхук
+// (переопределить функцию в другом файле или заменить тело).
+void __attribute__((weak)) notify_hook(const gs::Trigger& t) { (void)t; }
+
+// Выгребает очередь триггеров раз в итерацию цикла управления: печать в Serial + хук уведомления.
+static void drain_triggers() {
+    gs::Trigger tr[8];
+    for (size_t n; (n = canrx::drain_triggers(tr, 8)) > 0;) {
+        for (size_t i = 0; i < n; ++i) {
+            Serial.printf("TRIG #%lu %s sev=%s t=%lu v=%.0f aux=0x%lx %s\n", (unsigned long)tr[i].id, gs::trig_tag(tr[i].kind),
+                          gs::trig_severity_name(gs::trig_severity(tr[i].kind)), (unsigned long)tr[i].t_ms, (double)tr[i].value,
+                          (unsigned long)tr[i].aux, tr[i].text);
+            notify_hook(tr[i]);
+        }
+        if (n < 8) break;
+    }
+}
+
 // Задача ядра: опрос инвертора, решение, команда, публикация снимка. Работает независимо
 // от оболочки: зависание Wi-Fi/HTTP на неё не влияет (своя задача, свой WDT).
 static void gs_task(void*) {
     esp_task_wdt_add(nullptr);
     uint32_t next = millis();
     uint32_t seq = 0, ev_id = 0;
+    bool cells_seen = false;                       // последнее известное значение (если mutex CAN не взят)
     gs::Event events[gs::kEventCap]; size_t n_events = 0;
     for (;;) {
         esp_task_wdt_reset();
@@ -280,7 +300,7 @@ static void gs_task(void*) {
 
         { uint32_t lp; if (shell::take_logger_period(lp)) g_trk.set_period(lp * 1000u); }
         gs::Config nc;
-        if (shell::take_config(nc)) g_sv.set_config(nc);
+        if (shell::take_config(nc)) { g_sv.set_config(nc); canrx::set_watch_cfg(gs::make_watch_cfg(g_sv.config())); }
         { int mc = shell::take_manual(); if (mc >= 0 && !shell::sniff_only()) g_sv.manual_request(mc ? gs::Cmd::Connect : gs::Cmd::Disconnect, now_ms); }
 
         // safe-mode после аварийных перезагрузок отменяет режим приёма: защиты (возврат в сеть) важнее
@@ -296,6 +316,12 @@ static void gs_task(void*) {
         float a; uint64_t age;
         if (shell::ext_charge(a, age)) { ext_a = a; ext_age = age; }
         gs::Input in = gs::make_input(g_tel, now_ms, g_safe_mode, ext_a, ext_age);
+        {   // самая слабая ячейка из CAN (NaN — нет свежих данных); берём и в режиме приёма, чтобы показывать в /api/state
+            float cv = gs::kNaN; bool seen = cells_seen;
+            if (canrx::cell_snapshot(cv, seen)) cells_seen = seen; else cv = gs::kNaN;
+            in.cell_min_v = cv; in.cells_seen = cells_seen;
+        }
+        drain_triggers();                              // обработка триггеров BMS (генерируются задачей CAN асинхронно)
         gs::Decision d;
         if (!sniff_only) d = g_sv.step(in);            // в режиме приёма ядро не шагает: команд нет
 
@@ -308,8 +334,8 @@ static void gs_task(void*) {
             events[0] = e; if (n_events < gs::kEventCap) ++n_events;
             Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
         }
-        if (shell::serial_log()) Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u uart bytes=%u ferr=%u\n",
-                      g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid,
+        if (shell::serial_log()) Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d cell=%.3f flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u uart bytes=%u ferr=%u\n",
+                      g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid, (double)in.cell_min_v,
                       (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc,
                       (unsigned)g_uart_bytes.load(), (unsigned)g_uart_errs.load());
 
@@ -317,7 +343,7 @@ static void gs_task(void*) {
             const int64_t last = g_last_rt_ok_ms.load();
             const bool link = last >= 0 && (int64_t)now_ms - last <= 45000;
             const uint32_t problem_mask = gs::F_HARD_LOW | gs::F_SOFT_LOW | gs::F_NO_DATA | gs::F_DATA_DOUBTFUL | gs::F_GRID_LOST_LOW |
-                                          gs::F_SAFE_MODE | gs::F_CMD_RETRY | gs::F_RELAY_MISMATCH | gs::F_TIME_JUMP | gs::F_SINGLE_SRC;
+                                          gs::F_CELL_HARD | gs::F_CELL_LOW | gs::F_SAFE_MODE | gs::F_CMD_RETRY | gs::F_RELAY_MISMATCH | gs::F_TIME_JUMP | gs::F_SINGLE_SRC;
             gs::InvState st;
             if (sniff_only) st = gs::InvState::Sniff;
             else if (!link) st = gs::InvState::NoLink;
@@ -390,6 +416,7 @@ void setup() {
     g_sv.set_config(shell::load_config());
     shell::begin(esp_random());
     canrx::begin();      // пассивный CAN-сниффер батареи (отдельная задача, RS485 не затрагивает)
+    canrx::set_watch_cfg(gs::make_watch_cfg(g_sv.config()));   // пороги триггеров ячеек из конфигурации
     Serial.printf("gs boot: reset=%d short_boots=%u safe=%d\n", (int)esp_reset_reason(), (unsigned)rtc_short_boots, g_safe_mode);
     xTaskCreatePinnedToCore(gs_task, "gs_core", 8192, nullptr, 3, nullptr, 1);
     xTaskCreatePinnedToCore(led_task, "gs_led", 3072, nullptr, 1, nullptr, 0);

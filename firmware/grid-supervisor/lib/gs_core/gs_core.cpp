@@ -17,7 +17,7 @@ inline uint64_t since(uint64_t now, uint64_t then) { return now >= then ? now - 
 bool Config::validate() const {
     const float fv[] = {hard_floor_v, soft_on_v, soft_off_v, full_v, pow_min_base_w, load_factor,
                         ext_coef, ext_max_a, charge_max_a, v_valid_min, v_valid_max,
-                        v_mismatch_max, grid_present_v_min};
+                        v_mismatch_max, grid_present_v_min, cell_hard_floor_v, cell_soft_on_v, cell_off_min_v};
     for (float f : fv)
         if (!finite(f)) return false;
 
@@ -26,6 +26,12 @@ bool Config::validate() const {
     if (!(soft_off_v - soft_on_v >= 0.5f)) return false;
     if (!(full_v >= soft_off_v)) return false;
     if (!(full_v <= v_valid_max)) return false;
+
+    // защита по ячейкам: разумный диапазон LiFePO4 и строгий порядок порогов
+    for (float c : {cell_hard_floor_v, cell_soft_on_v, cell_off_min_v})
+        if (c < 2.5f || c > 3.65f) return false;
+    if (!(cell_hard_floor_v < cell_soft_on_v && cell_soft_on_v < cell_off_min_v)) return false;
+    if (cell_guard > 2) return false;
 
     if (!(pow_min_base_w > 0.0f)) return false;          // иначе 0 А «достаточно» для отключения
     if (load_factor < 0.0f || load_factor > 2.0f) return false;
@@ -77,6 +83,8 @@ Decision Supervisor::step(const Input& in) {
         last_valid_ms_ = now;
         if (hard_since_ >= 0) hard_since_ = static_cast<int64_t>(now);
         if (soft_since_ >= 0) soft_since_ = static_cast<int64_t>(now);
+        if (cell_hard_since_ >= 0) cell_hard_since_ = static_cast<int64_t>(now);
+        if (cell_soft_since_ >= 0) cell_soft_since_ = static_cast<int64_t>(now);
         off_since_ = kInactive;
         pending_since_ = now;
         if (last_connect_ms_ >= 0) last_connect_ms_ = static_cast<int64_t>(now);
@@ -149,12 +157,31 @@ Decision Supervisor::step(const Input& in) {
         }
     };
 
+    // Ячейки: данные независимы от опроса инвертора. Нет свежих данных — таймеры НЕ сбрасываем
+    // (последнее состояние продолжается, сторона сети), как и для напряжения пакета.
+    const bool cell_fresh = cfg_.cell_guard >= 1 && finite(in.cell_min_v);
+    if (cell_fresh) {
+        track(cell_hard_since_, in.cell_min_v <= cfg_.cell_hard_floor_v);
+        track(cell_soft_since_, in.cell_min_v <= cfg_.cell_soft_on_v);
+    } else if (cfg_.cell_guard == 0) {
+        cell_hard_since_ = cell_soft_since_ = kInactive;
+    }
+    // Можно ли отключаться с точки зрения ячеек (асимметрия: сомнение = нельзя).
+    bool cell_off_ok = true;
+    if (cfg_.cell_guard >= 1) {
+        if (cell_fresh) cell_off_ok = in.cell_min_v >= cfg_.cell_off_min_v;
+        else if (cfg_.cell_guard == 2 && in.cells_seen) cell_off_ok = false;
+    }
+    bool cell_block = false;
+
     if (fresh) {
         track(hard_since_, v <= cfg_.hard_floor_v);
         track(soft_since_, v <= cfg_.soft_on_v);
         const bool by_power = load_known && v >= cfg_.soft_off_v && eff * v >= pow_min;
         const bool by_full = !single && v >= cfg_.full_v;   // «полный» без проверки мощности — только по двум источникам
-        track(off_since_, reg == 1 && !doubtful && (by_power || by_full));
+        const bool pack_off = reg == 1 && !doubtful && (by_power || by_full);
+        cell_block = pack_off && !cell_off_ok;
+        track(off_since_, pack_off && cell_off_ok);   // ячейка ниже порога: выдержка «заряжено» начнётся заново
     } else {
         // Нет свежих данных: «низкие» таймеры НЕ сбрасываем (последнее состояние считаем
         // продолжающимся — сторона сети), а «заряжено» обнуляем сразу.
@@ -163,13 +190,16 @@ Decision Supervisor::step(const Input& in) {
 
     // ---- 4. решение --------------------------------------------------------------------------
     const bool paused = now < pause_until_ms_;
-    const bool hard_trip = hard_since_ >= 0 && since(now, static_cast<uint64_t>(hard_since_)) >= cfg_.hard_dwell_ms;
-    const bool soft_trip = soft_since_ >= 0 && since(now, static_cast<uint64_t>(soft_since_)) >= cfg_.soft_on_dwell_ms;
+    auto elapsed = [&](int64_t t, uint32_t dwell) { return t >= 0 && since(now, static_cast<uint64_t>(t)) >= dwell; };
+    const bool hard_trip = elapsed(hard_since_, cfg_.hard_dwell_ms) || elapsed(cell_hard_since_, cfg_.hard_dwell_ms);
+    const bool soft_trip = elapsed(soft_since_, cfg_.soft_on_dwell_ms) || elapsed(cell_soft_since_, cfg_.soft_on_dwell_ms);
     const bool off_trip  = off_since_ >= 0 && since(now, static_cast<uint64_t>(off_since_)) >= cfg_.soft_off_dwell_ms;
     const bool hold = last_connect_ms_ >= 0 && since(now, static_cast<uint64_t>(last_connect_ms_)) < cfg_.hold_after_connect_ms;
 
     if (hard_since_ >= 0) flags |= F_HARD_LOW;
     if (soft_since_ >= 0) flags |= F_SOFT_LOW;
+    if (cell_hard_since_ >= 0) flags |= F_CELL_HARD;
+    if (cell_soft_since_ >= 0) flags |= F_CELL_LOW;
     if (no_data) flags |= F_NO_DATA;
     if (!fresh) flags |= F_STALE;
     if (doubtful) flags |= F_DATA_DOUBTFUL;
@@ -185,6 +215,9 @@ Decision Supervisor::step(const Input& in) {
     if (fresh && finite(in.grid_v) && in.grid_v < cfg_.grid_present_v_min && v <= cfg_.soft_on_v)
         flags |= F_GRID_LOST_LOW;
 
+    if (manual_req_ == Cmd::Disconnect && !cell_off_ok) cell_block = true;   // ручное отключение тоже не обходит ячейки
+    if (cell_block) flags |= F_CELL_BLOCK;
+
     Cmd want = Cmd::None;
     Reason why = Reason::None;
     if (hard_trip) {
@@ -194,7 +227,8 @@ Decision Supervisor::step(const Input& in) {
     } else if (no_data) {
         want = Cmd::Connect; why = Reason::NoData;                   // ничто не отменяет
     } else if (manual_req_ == Cmd::Connect ||
-               (manual_req_ == Cmd::Disconnect && fresh && !doubtful && hard_since_ < 0 && soft_since_ < 0)) {
+               (manual_req_ == Cmd::Disconnect && fresh && !doubtful && hard_since_ < 0 && soft_since_ < 0 &&
+                                              cell_hard_since_ < 0 && cell_soft_since_ < 0 && cell_off_ok)) {
         want = manual_req_; why = Reason::Manual;                    // человек: пауза уже включена в manual_request()
     } else if (!paused && soft_trip) {
         want = Cmd::Connect; why = Reason::SoftLow;

@@ -16,6 +16,8 @@ const CfgField kCfgFields[] = {
     F(cmd_retry_ms, x, U32), F(pow_min_base_w, f, F32), F(load_factor, f, F32), F(ext_coef, f, F32),
     F(ext_ttl_ms, x, U32), F(ext_max_a, f, F32), F(charge_max_a, f, F32), F(step_gap_ms, u, U32),
     F(v_valid_min, x, F32), F(v_valid_max, f, F32), F(v_mismatch_max, f, F32), F(grid_present_v_min, f, F32),
+    // защита по ячейкам: ДОБАВЛЕНО В КОНЕЦ, чтобы индексы ключей NVS ("c00"...) прежних полей не менялись
+    F(cell_hard_floor_v, f, F32), F(cell_soft_on_v, f, F32), F(cell_off_min_v, f, F32), F(cell_guard, u, U8),
 };
 #undef F
 const size_t kCfgFieldCount = sizeof(kCfgFields) / sizeof(kCfgFields[0]);
@@ -35,6 +37,11 @@ static bool set_raw(Config& cfg, const char* key, const char* value) {
         float v = strtof(value, &end);
         if (*end || !std::isfinite(v)) return false;
         memcpy(reinterpret_cast<char*>(&cfg) + f->off, &v, 4);
+    } else if (f->kind == CfgField::U8) {
+        if (*value == '-') return false;
+        unsigned long v = strtoul(value, &end, 10);
+        if (*end || v > 255) return false;
+        *(reinterpret_cast<uint8_t*>(&cfg) + f->off) = (uint8_t)v;
     } else {
         if (*value == '-') return false;
         unsigned long v = strtoul(value, &end, 10);
@@ -63,6 +70,7 @@ bool config_get(const Config& cfg, const char* key, char* out, size_t cap) {
     if (!f) return false;
     const char* p = reinterpret_cast<const char*>(&cfg) + f->off;
     if (f->kind == CfgField::F32) { float v; memcpy(&v, p, 4); snprintf(out, cap, "%.9g", v); }
+    else if (f->kind == CfgField::U8) snprintf(out, cap, "%u", (unsigned)*reinterpret_cast<const uint8_t*>(p));
     else { uint32_t v; memcpy(&v, p, 4); snprintf(out, cap, "%lu", (unsigned long)v); }
     return true;
 }
@@ -90,6 +98,7 @@ size_t flags_to_str(uint32_t fl, char* out, size_t cap) {
         {F_GRID_LOST_LOW, "GRID_LOST_LOW"}, {F_SAFE_MODE, "SAFE_MODE"}, {F_CMD_PENDING, "CMD_PENDING"},
         {F_CMD_RETRY, "CMD_RETRY"}, {F_OFF_COND, "OFF_COND"}, {F_HOLD, "HOLD"}, {F_SINGLE_SRC, "SINGLE_SRC"},
         {F_TIME_JUMP, "TIME_JUMP"}, {F_LOAD_UNKNOWN, "LOAD_UNKNOWN"}, {F_RELAY_MISMATCH, "RELAY_MISMATCH"},
+        {F_CELL_HARD, "CELL_HARD"}, {F_CELL_LOW, "CELL_LOW"}, {F_CELL_BLOCK, "CELL_BLOCK"},
     };
     size_t n = 0;
     if (!cap) return 0;
@@ -116,11 +125,12 @@ const char* reason_name(Reason r) {
 }
 
 size_t state_to_json(const StateView& s, char* out, size_t cap) {
-    char vp[16], va[16], ch[16], ld[16], gv[16], vu[16], ef[16], pm[16], fl[200], ts[32] = "";
+    char vp[16], va[16], ch[16], ld[16], gv[16], vu[16], ef[16], pm[16], fl[260], ts[32] = "", cm[16];
     num(vp, sizeof vp, s.tel->pack_v); num(va, sizeof va, s.tel->pack_v_alt);
     num(ch, sizeof ch, s.tel->chg_curr_a); num(ld, sizeof ld, s.tel->load_w); num(gv, sizeof gv, s.tel->grid_v);
     num(vu, sizeof vu, s.dec->v_used); num(ef, sizeof ef, s.dec->eff_charge_a); num(pm, sizeof pm, s.dec->pow_min_w);
     flags_to_str(s.dec->flags, fl, sizeof fl);
+    snprintf(cm, sizeof cm, "null"); if (s.in && std::isfinite(s.in->cell_min_v)) snprintf(cm, sizeof cm, "%.3f", s.in->cell_min_v);
     char bat[320];
     if (!battery_brief_json(s.bat ? *s.bat : BatteryBrief(), bat, sizeof bat)) { if (cap) out[0] = 0; return 0; }
     if (s.epoch_s >= 0) {
@@ -134,6 +144,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         "\"voltages\":{\"battery\":%s,\"alt\":%s,\"grid\":%s},\"charge_a\":%s,\"load_w\":%s,"
         "\"ongrid_reg\":%d,\"relay_grid\":%d,\"rt_ok\":%s,\"chg_ok\":%s,\"cfg_ok\":%s,"
         "\"decision\":{\"v_used\":%s,\"eff_charge_a\":%s,\"pow_min_w\":%s,\"flags\":\"%s\",\"flags_raw\":%lu},"
+        "\"guard\":{\"cell_min_v\":%s,\"cells_seen\":%s,\"cell_block\":%s},"
         "\"mode\":\"%s\",\"safe_mode\":%s,\"paused\":%s,\"pause_left_s\":%llu,"
         "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu},\"battery\":%s,\"events\":[",
         (unsigned long)s.seq, (unsigned long)s.boot_id, (unsigned long long)s.uptime_ms,
@@ -142,6 +153,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         vp, va, gv, ch, ld, (int)s.tel->ongrid_reg, (int)s.tel->relay_grid,
         s.tel->rt_ok ? "true" : "false", s.tel->chg_ok ? "true" : "false", s.tel->cfg_ok ? "true" : "false",
         vu, ef, pm, fl, (unsigned long)s.dec->flags,
+        cm, s.in && s.in->cells_seen ? "true" : "false", (s.dec->flags & F_CELL_BLOCK) ? "true" : "false",
         s.sniff_only ? "sniff" : "normal", s.safe_mode ? "true" : "false", s.paused ? "true" : "false", (unsigned long long)(s.pause_left_ms / 1000),
         (unsigned long)s.rx_ok, (unsigned long)s.rx_err, (unsigned long)s.rx_foreign, (unsigned long)s.rx_busy,
         (unsigned long)s.rx_exc, bat);

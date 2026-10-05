@@ -4,6 +4,8 @@
 #include <driver/twai.h>
 #include <esp_timer.h>
 #include <atomic>
+#include <cmath>
+#include <ctime>
 
 // Пины T-CAN485 по схеме платы и примерам LilyGo; ПОДЛЕЖАТ ПРОВЕРКЕ на железе (переопределяются -D).
 #ifndef GS_CAN_TX
@@ -38,9 +40,23 @@ static gs::PylonBattery g_bat;             // Pylon-совместимый пр�
 static gs::SeplosBattery g_sep;           // реальный протокол Seplos 100 кбит/с (29-бит ID, гипотеза)
 static gs::Seplos500Battery g_sep5;       // «Pylon CAN» режим BMS на деле: 500 кбит/с, стандартные ID 0x311…0x322, big-endian (гипотеза)
 static gs::CanDriverInfo g_info;
+// Генерация триггеров: все четыре объекта защищены g_mtx (пишет задача CAN, читают цикл управления и HTTP).
+static gs::BmsWatch g_watch;
+static gs::TriggerQueue g_tq;
+static gs::BmsEventLog g_blog;
+static bool g_cells_seen = false;           // ячейки хоть раз были свежими с момента (пере)запуска драйвера
 static uint32_t g_base_missed = 0, g_base_errs = 0;     // счётчики прежней установки драйвера (после переустановки после сбоя)
 
 static uint32_t ms32() { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+// Вызывать под g_mtx: снимок BMS -> генератор триггеров (по переходам). После каждого кадра и раз в ~0.5 с (чтобы заметить «кадры пропали»).
+static void watch_locked() {
+    const uint32_t now = ms32();
+    const gs::BmsSnapshot s = gs::make_bms_snapshot(g_bat, g_sep, g_sep5, now);
+    if (s.cells_valid) g_cells_seen = true;
+    const time_t tt = time(nullptr);
+    g_watch.update(s, now, g_tq, &g_blog, tt > 1700000000 ? (int64_t)tt : -1);
+}
 
 static bool drv_install(int kbps) {
     twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)GS_CAN_TX, (gpio_num_t)GS_CAN_RX, (g_ack.load() || g_hb.load()) ? TWAI_MODE_NORMAL : TWAI_MODE_LISTEN_ONLY);
@@ -72,6 +88,7 @@ static void apply(int want) {
     if (want) g_installed = drv_install(want);
     xSemaphoreTake(g_mtx, portMAX_DELAY);
     g_stats.clear(); g_bat = gs::PylonBattery(); g_sep = gs::SeplosBattery(); g_sep5 = gs::Seplos500Battery();
+    g_watch.reset(); g_cells_seen = false;       // смена скорости/переустановка: данные начинаются заново (baseline без триггеров)
     g_base_missed = g_base_errs = 0;
     g_info = gs::CanDriverInfo();
     g_info.enabled = want != 0; g_info.speed_kbps = (uint16_t)want; g_info.ack = g_ack.load() || g_hb.load(); g_info.hb = g_hb.load();
@@ -101,6 +118,7 @@ static void housekeeping() {
     g_info.rx_missed = g_base_missed + si.rx_missed_count + si.rx_overrun_count;
     g_info.bus_errors = g_base_errs + si.bus_error_count;
     g_info.rx_err_counter = si.rx_error_counter;
+    watch_locked();                                   // таймерная проверка: BmsStale без кадров
     xSemaphoreGive(g_mtx);
 }
 
@@ -129,6 +147,7 @@ static void can_task(void*) {
             memcpy(f.data, m.data, f.dlc);
             xSemaphoreTake(g_mtx, portMAX_DELAY);
             g_stats.on_frame(f); g_bat.feed(f); g_sep.feed(f); g_sep5.feed(f); ++g_info.rx_msgs;
+            watch_locked();
             xSemaphoreGive(g_mtx);
             if (millis() - hk >= 500) break;
         }
@@ -143,7 +162,7 @@ void begin() {
     p.end();
     { Preferences q; q.begin("gs", true); g_hb.store(q.getBool("canhb", false)); g_ack.store(q.getBool("canack", false)); q.end(); }
     g_want.store(v == 0 || v == 100 || v == 125 || v == 250 ? (int)v : 500);
-    xTaskCreatePinnedToCore(can_task, "gs_can", 4096, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(can_task, "gs_can", 6144, nullptr, 2, nullptr, 0);
 }
 
 void set_speed(int kbps) {
@@ -169,6 +188,38 @@ void brief(gs::BatteryBrief& out) {
     if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(50))) return;
     out = gs::battery_brief(g_bat, g_sep, g_sep5, ms32());
     xSemaphoreGive(g_mtx);
+}
+
+void set_watch_cfg(const gs::WatchCfg& c) {
+    if (!g_mtx) return;
+    xSemaphoreTake(g_mtx, portMAX_DELAY);
+    g_watch.set_cfg(c);
+    xSemaphoreGive(g_mtx);
+}
+
+bool cell_snapshot(float& cell_min_v, bool& cells_seen) {
+    if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(50))) return false;
+    int mn = 0, mx = 0;
+    // cell_range: свежесть 10 с (kCanStaleMs); для протоколов без ячеек данных нет
+    cell_min_v = g_sep5.cell_range(ms32(), &mn, &mx) ? mn * 0.001f : NAN;
+    cells_seen = g_cells_seen;
+    xSemaphoreGive(g_mtx);
+    return true;
+}
+
+size_t drain_triggers(gs::Trigger* out, size_t max) {
+    size_t n = 0;
+    if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(50))) return 0;
+    while (n < max && g_tq.pop(out[n])) ++n;
+    xSemaphoreGive(g_mtx);
+    return n;
+}
+
+size_t events_json(char* out, size_t cap) {
+    if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) return 0;
+    size_t n = gs::bms_events_to_json(g_blog, ms32(), out, cap);
+    xSemaphoreGive(g_mtx);
+    return n;
 }
 
 size_t api_json(char* out, size_t cap) {

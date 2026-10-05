@@ -164,7 +164,7 @@ static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 
 static void h_state() {
     // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
-    static char buf[3072];     // худший случай (8 событий + батарея) ~1.8 КБ
+    static char buf[3072];     // худший случай (8 событий + батарея + guard) ~2.1 КБ
     static Snapshot s;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
     s = g_snap; xSemaphoreGive(g_mtx);
@@ -265,6 +265,16 @@ static void h_can() {
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
 }
 
+// GET /api/bms_events — журнал последних 16 событий BMS (изменения «знаковых» полей, ячейки, пропажа кадров), от новых к старым.
+static void h_bms_events() {
+    // чтение открыто без пароля (в API нет секретов), как /api/state
+    touch_api();
+    static char buf[4096];     // 16 событий × <= ~220 байт
+    size_t n = canrx::events_json(buf, sizeof buf);
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
+}
+
 // POST /api/can  [speed=0|100|125|250|500] [ack=0|1] [hb=0|1] — скорость CAN-сниффера, кбит/с (0 = выключить) и подтверждение кадров (ACK); сохраняется в NVS.
 static void h_can_set() {
     if (!authed(true)) return;
@@ -328,7 +338,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
@@ -740,6 +750,7 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/sniff", HTTP_GET, h_sniff);
     g_http.on("/api/can", HTTP_GET, h_can);
     g_http.on("/api/can", HTTP_POST, h_can_set);
+    g_http.on("/api/bms_events", HTTP_GET, h_bms_events);
     g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/api/logger", HTTP_POST, h_logger);
     g_http.on("/setup", HTTP_ANY, h_setup);

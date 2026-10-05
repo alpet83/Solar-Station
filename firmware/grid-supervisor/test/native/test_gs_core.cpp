@@ -1,4 +1,5 @@
 #include "../../lib/gs_core/gs_core.h"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,7 @@ struct Sim {
     Supervisor sv; uint64_t t = 1000; int8_t reg = 1;
     float v = 52.0f, alt = 52.0f, chg = 0, ext = kNaN, load = 500, grid = 230;
     bool sample = true, safe = false; uint64_t ext_age = 0;
+    float cell = kNaN; bool seen = false;   // ячейка: NaN — нет свежих данных
     Cmd last = Cmd::None; Reason lastr = Reason::None; uint32_t flags = 0;
     int n_conn = 0, n_disc = 0; uint64_t first_conn = 0, first_disc = 0;
     explicit Sim(const Config& c = Config()) : sv(c) {}
@@ -22,7 +24,7 @@ struct Sim {
         t += dt;
         Input in; in.now_ms = t; in.have_sample = sample; in.pack_v = v; in.pack_v_alt = alt;
         in.charge_a = chg; in.ext_charge_a = ext; in.ext_age_ms = ext_age; in.load_w = load;
-        in.grid_v = grid; in.ongrid_reg = reg; in.safe_mode = safe;
+        in.grid_v = grid; in.ongrid_reg = reg; in.safe_mode = safe; in.cell_min_v = cell; in.cells_seen = seen;
         Decision d = sv.step(in); last = d.cmd; lastr = d.reason; flags = d.flags;
         if (d.cmd == Cmd::Connect) { if (!n_conn) first_conn = t; ++n_conn; reg = 1; }  // идеальный инвертор
         if (d.cmd == Cmd::Disconnect) { if (!n_disc) first_disc = t; ++n_disc; reg = 0; }
@@ -286,6 +288,112 @@ static void test_manual_request() {
     c2.sv.manual_request(Cmd::Connect, c2.t); d = c2.tick(); CHECK(d.cmd == Cmd::Connect && d.reason == Reason::Manual);
 }
 
+// ---- защита по самой слабой ячейке ---------------------------------------------------------------------
+static Config cfast(uint8_t guard = 1) { Config c = fast(); c.cell_guard = guard; return c; }
+
+static void test_cell_config() {
+    Config c; CHECK(c.cell_hard_floor_v == 2.90f && c.cell_soft_on_v == 3.05f && c.cell_off_min_v == 3.20f && c.cell_guard == 1);
+    Config b = c; b.cell_hard_floor_v = 2.4f; CHECK(!b.validate());
+    b = c; b.cell_off_min_v = 3.7f; CHECK(!b.validate());
+    b = c; b.cell_soft_on_v = 2.9f; CHECK(!b.validate());              // hard < soft строго
+    b = c; b.cell_off_min_v = 3.05f; CHECK(!b.validate());             // soft < off_min строго
+    b = c; b.cell_hard_floor_v = kNaN; CHECK(!b.validate());
+    b = c; b.cell_guard = 3; CHECK(!b.validate());
+    b = c; b.cell_guard = 0; CHECK(b.validate());
+    b = c; b.cell_hard_floor_v = 2.5f; b.cell_off_min_v = 3.65f; CHECK(b.validate());
+}
+
+static void test_cell_soft_connect() {
+    Sim s(cfast()); s.reg = 0; s.v = s.alt = 52.0f; s.cell = 3.04f; s.seen = true;     // пакет в норме, ячейка падает
+    uint64_t t0 = s.t; s.run(110000); CHECK(s.n_conn == 0); CHECK(s.flags & F_CELL_LOW); CHECK(!(s.flags & (F_SOFT_LOW | F_CELL_HARD)));
+    s.run(20000); CHECK(s.n_conn == 1);
+    CHECK(s.first_conn - t0 >= 120000 && s.first_conn - t0 <= 130000);
+    // причина команды — SoftLow
+    Sim r(cfast()); r.reg = 0; r.cell = 3.0f; r.seen = true; Decision d; for (int i = 0; i < 40 && d.cmd == Cmd::None; ++i) d = r.tick();
+    CHECK(d.cmd == Cmd::Connect && d.reason == Reason::SoftLow && (d.flags & F_CELL_LOW));
+    // порог включительно (<=), и отскок сбрасывает таймер
+    Sim e(cfast()); e.reg = 0; e.cell = 3.05f; e.seen = true; e.tick(); CHECK(e.flags & F_CELL_LOW);
+    Sim b(cfast()); b.reg = 0; b.cell = 3.0f; b.seen = true; b.run(60000); b.cell = 3.3f; b.run(10000); b.cell = 3.0f; b.run(100000);
+    CHECK(b.n_conn == 0);
+    // мягкий порог по ячейке молчит во время ручной паузы
+    Sim p(cfast()); p.reg = 1; p.tick(); p.reg = 0; p.tick(); CHECK(p.flags & F_MANUAL_OVERRIDE);
+    p.cell = 3.0f; p.seen = true; p.run(300000); CHECK(p.n_conn == 0 && (p.flags & F_CELL_LOW));
+}
+
+static void test_cell_hard_connect() {
+    Sim s(cfast()); s.reg = 0; s.cell = 2.85f; s.seen = true;
+    uint64_t t0 = s.t; s.run(10000); CHECK(s.n_conn == 0); CHECK(s.flags & F_CELL_HARD);
+    s.run(15000); CHECK(s.n_conn == 1); CHECK(s.first_conn - t0 <= 25000);
+    Sim r(cfast()); r.reg = 0; r.cell = 2.9f; r.seen = true; Decision d; for (int i = 0; i < 10 && d.cmd == Cmd::None; ++i) d = r.tick();
+    CHECK(d.cmd == Cmd::Connect && d.reason == Reason::HardFloor && (d.flags & F_CELL_HARD) && !(d.flags & F_HARD_LOW));
+    // жёсткий порог по ячейке перебивает ручную паузу
+    Sim p(cfast()); p.reg = 1; p.tick(); p.reg = 0; p.tick(); CHECK(p.flags & F_MANUAL_OVERRIDE);
+    p.cell = 2.8f; p.seen = true; p.run(30000); CHECK(p.n_conn == 1);
+    // ... и ручное отключение
+    Sim h(cfast()); h.reg = 1; h.cell = 2.8f; h.seen = true; h.tick();
+    h.sv.manual_request(Cmd::Disconnect, h.t); h.run(60000); CHECK(h.n_disc == 0);
+    // работает, когда инвертор молчит (данные пакета устарели): не ждём no_data
+    Sim n(cfast()); n.reg = 0; n.sample = false; n.v = n.alt = 53; n.cell = 2.8f; n.seen = true;
+    uint64_t t1 = n.t; n.run(40000); CHECK(n.n_conn == 1 && n.first_conn - t1 <= 25000);
+    // данные ячеек пропали на середине dwell: таймер продолжается (сторона сети)
+    Sim g(cfast()); g.reg = 0; g.cell = 2.8f; g.seen = true; g.run(10000); g.cell = kNaN; g.run(15000); CHECK(g.n_conn == 1);
+    // safe-mode: подключаем сразу, как и раньше
+    Sim q(cfast()); q.reg = 0; q.safe = true; q.cell = 3.3f; q.seen = true; q.tick(); CHECK(q.n_conn == 1 && q.lastr == Reason::SafeMode);
+}
+
+static void test_cell_disconnect_block() {
+    // пакет «заряжен» (53.5 В, 30 А), ячейка между soft (3.05) и off_min (3.20): не отключаемся
+    Sim s(cfast()); s.reg = 1; s.v = s.alt = 53.5f; s.chg = 30; s.load = 300; s.cell = 3.10f; s.seen = true;
+    s.run(900000); CHECK(s.n_disc == 0); CHECK(s.flags & F_CELL_BLOCK); CHECK(!(s.flags & F_OFF_COND)); CHECK(s.n_conn == 0);
+    // ячейка вышла выше cell_off_min_v: выдержка «заряжено» стартует заново
+    s.cell = 3.20f; s.run(290000); CHECK(s.n_disc == 0); CHECK(!(s.flags & F_CELL_BLOCK));
+    s.run(30000); CHECK(s.n_disc == 1);
+    // граница: ровно cell_off_min_v достаточно, чуть ниже — нет
+    Sim b(cfast()); b.reg = 1; b.v = b.alt = 53.5f; b.chg = 30; b.load = 300; b.cell = 3.199f; b.seen = true; b.run(700000); CHECK(b.n_disc == 0);
+    // guard = 0: ячейки игнорируются, и низкая ячейка ничего не подключает
+    Sim z(cfast(0)); z.reg = 1; z.v = z.alt = 53.5f; z.chg = 30; z.load = 300; z.cell = 3.0f; z.seen = true;
+    z.run(340000); CHECK(z.n_disc == 1 && z.n_conn == 0 && !(z.flags & (F_CELL_LOW | F_CELL_BLOCK)));
+    Sim y(cfast(0)); y.reg = 0; y.cell = 2.5f; y.seen = true; y.run(300000); CHECK(y.n_conn == 0);
+    // guard = 1, ячеек нет (NaN) — поведение прежнее, даже если раньше были видны
+    Sim n(cfast(1)); n.reg = 1; n.v = n.alt = 53.5f; n.chg = 30; n.load = 300; n.seen = true;
+    n.run(340000); CHECK(n.n_disc == 1 && !(n.flags & F_CELL_BLOCK));
+    // guard = 2: ячейки были видны, данных нет — не отключаемся, флаг
+    Sim g(cfast(2)); g.reg = 1; g.v = g.alt = 53.5f; g.chg = 30; g.load = 300; g.seen = true;
+    g.run(900000); CHECK(g.n_disc == 0); CHECK(g.flags & F_CELL_BLOCK);
+    // guard = 2, но ячейки в этом запуске не были видны (протокол без ячеек): отключаемся
+    Sim h(cfast(2)); h.reg = 1; h.v = h.alt = 53.5f; h.chg = 30; h.load = 300; h.seen = false;
+    h.run(340000); CHECK(h.n_disc == 1 && !(h.flags & F_CELL_BLOCK));
+    // guard = 2, данные вернулись и ячейка в порядке: отключаемся
+    g.cell = 3.3f; g.run(340000); CHECK(g.n_disc == 1);
+    // ручное отключение тоже упирается в ячейки (но не в отсутствие данных при guard = 1)
+    Sim m(cfast()); m.reg = 1; m.cell = 3.1f; m.seen = true; m.tick();
+    m.sv.manual_request(Cmd::Disconnect, m.t); Decision d = m.tick(); CHECK(d.cmd == Cmd::None && (d.flags & F_CELL_BLOCK) && m.reg == 1);
+    Sim m2(cfast()); m2.reg = 1; m2.cell = 3.3f; m2.seen = true; m2.tick();
+    m2.sv.manual_request(Cmd::Disconnect, m2.t); d = m2.tick(); CHECK(d.cmd == Cmd::Disconnect && d.reason == Reason::Manual);
+    // ручное отключение при слабой ячейке, уже ниже soft-порога, тоже блокируется
+    Sim m3(cfast()); m3.reg = 1; m3.cell = 3.0f; m3.seen = true; m3.tick();
+    m3.sv.manual_request(Cmd::Disconnect, m3.t); d = m3.tick(); CHECK(d.cmd == Cmd::None);
+}
+
+static void test_cell_nan_unchanged() {
+    // NaN-ячейки и cells_seen=false: ровно прежнее поведение (контрольные сценарии из test_smooth_discharge / test_disconnect_conditions)
+    Sim s; s.reg = 0; s.v = 51.4f; s.alt = 51.4f; s.run(110000); CHECK(s.n_conn == 0); s.run(20000); CHECK(s.n_conn == 1);
+    Sim d(fast()); d.reg = 1; d.v = d.alt = 53.5f; d.chg = 30; d.load = 300; d.run(290000); CHECK(d.n_disc == 0); d.run(30000); CHECK(d.n_disc == 1);
+    CHECK(!(d.flags & (F_CELL_HARD | F_CELL_LOW | F_CELL_BLOCK)));
+    // бессмысленные значения ячейки: inf не считается «свежими данными»
+    Sim w(cfast()); w.reg = 0; w.cell = INFINITY; w.seen = true; w.run(300000); CHECK(w.n_conn == 0);
+}
+
+static void test_cell_pack_and_cell_combined() {
+    // обе причины одновременно: пакет в норме, ячейка низкая -> флаг только по ячейке; потом пакет падает -> оба флага
+    Sim s(cfast()); s.reg = 0; s.cell = 3.0f; s.seen = true; s.v = s.alt = 52.0f; s.tick();
+    CHECK((s.flags & F_CELL_LOW) && !(s.flags & F_SOFT_LOW));
+    s.v = s.alt = 51.0f; s.tick(); CHECK((s.flags & F_CELL_LOW) && (s.flags & F_SOFT_LOW));
+    // set_config применяет валидные пороги ячеек и отвергает невалидные
+    Supervisor sv; Config c; c.cell_guard = 2; CHECK(sv.set_config(c) && sv.config().cell_guard == 2);
+    c.cell_soft_on_v = 2.8f; CHECK(!sv.set_config(c) && sv.config().cell_guard == 2);
+}
+
 static std::vector<std::vector<double>> load_csv(const char* p) {
     std::vector<std::vector<double>> r; std::ifstream f(p); std::string line; std::getline(f, line);
     while (std::getline(f, line)) {
@@ -327,6 +435,8 @@ int main(int argc, char** argv) {
     test_single_source_full(); test_validate_bounds(); test_connect_over_pending_disconnect(); test_cmd_reason_at_issue();
     test_retry_backoff_and_relay();
     test_manual_request();
+    test_cell_config(); test_cell_soft_connect(); test_cell_hard_connect(); test_cell_disconnect_block();
+    test_cell_nan_unchanged(); test_cell_pack_and_cell_combined();
     test_incident_replay(argc > 1 ? argv[1] : "test/native/fixtures/incident_2026-10-01.csv");
     printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

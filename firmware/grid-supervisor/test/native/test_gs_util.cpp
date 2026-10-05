@@ -29,12 +29,34 @@ int main() {
         CHECK(config_set(d, kCfgFields[i].key, b));
         for (size_t j = 0; j < i; ++j) CHECK(strcmp(kCfgFields[i].key, kCfgFields[j].key) != 0);
     }
-    char js[1200]; size_t n = config_to_json(c, js, sizeof js);
+    // защита по ячейкам: ключи, uint8-поле, валидация порядка порогов
+    {
+        Config d;
+        CHECK(config_set(d, "cell_guard", "2") && d.cell_guard == 2);
+        CHECK(!config_set(d, "cell_guard", "3") && d.cell_guard == 2);
+        CHECK(!config_set(d, "cell_guard", "256") && !config_set(d, "cell_guard", "-1") && !config_set(d, "cell_guard", "x"));
+        CHECK(config_set(d, "cell_guard", "0") && d.cell_guard == 0);
+        CHECK(config_set(d, "cell_soft_on_v", "3.1") && d.cell_soft_on_v == 3.1f);
+        CHECK(!config_set(d, "cell_off_min_v", "3.0"));                                // ниже soft
+        CHECK(!config_set(d, "cell_hard_floor_v", "3.2"));                             // выше soft
+        CHECK(!config_set(d, "cell_hard_floor_v", "2.0"));                             // вне диапазона
+        const char* k[] = {"cell_hard_floor_v", "cell_soft_on_v", "cell_off_min_v"}; const char* vv[] = {"3.0", "3.2", "3.3"};
+        CHECK(config_apply_pairs(d, k, vv, 3) && d.cell_off_min_v == 3.3f);            // набор из нескольких порогов сразу
+        char b[32]; CHECK(config_get(d, "cell_guard", b, sizeof b) && !strcmp(b, "0"));
+        // соседние поля не затронуты записью uint8
+        Config e; config_set(e, "cell_guard", "2"); CHECK(e.cell_off_min_v == 3.20f && e.cell_hard_floor_v == 2.90f);
+        // порядок ключей NVS прежних полей не изменился: новые — в конце
+        CHECK(!strcmp(kCfgFields[21].key, "grid_present_v_min") && !strcmp(kCfgFields[22].key, "cell_hard_floor_v"));
+        char j[1600]; CHECK(config_to_json(d, j, sizeof j) > 0 && strstr(j, "\"cell_guard\":0") && strstr(j, "\"cell_soft_on_v\":3.2"));
+    }
+    char js[1600]; size_t n = config_to_json(c, js, sizeof js);
     CHECK(n > 100 && js[0] == '{' && js[n - 1] == '}');
     char tiny[20]; CHECK(config_to_json(c, tiny, sizeof tiny) == 0);
 
     char fl[200]; flags_to_str(F_SOFT_LOW | F_HOLD, fl, sizeof fl); CHECK(!strcmp(fl, "SOFT_LOW,HOLD"));
     flags_to_str(0, fl, sizeof fl); CHECK(fl[0] == 0);
+    flags_to_str(F_CELL_HARD | F_CELL_LOW | F_CELL_BLOCK, fl, sizeof fl); CHECK(!strcmp(fl, "CELL_HARD,CELL_LOW,CELL_BLOCK"));
+    { char big[260]; size_t all = flags_to_str(0xFFFFFFFFu, big, sizeof big); CHECK(all > 0 && all < 259 && strstr(big, "CELL_BLOCK") && strstr(big, "RELAY_MISMATCH")); printf("all flags string = %zu chars\n", all); }
     char s5[5]; flags_to_str(0xFFFFFFFFu, s5, sizeof s5); CHECK(strlen(s5) < 5);
 
     Telemetry t; t.pack_v = 51.8f; t.rt_ok = true; t.ongrid_reg = 1;
@@ -43,6 +65,11 @@ int main() {
     char out[1200]; size_t m = state_to_json(sv, out, sizeof out);
     CHECK(m > 0 && strstr(out, "\"ts\":\"2026-10-01") && strstr(out, "\"source\":\"supervisor\""));
     CHECK(strstr(out, "\"alt\":null"));                                      // NaN -> null
+    CHECK(strstr(out, "\"guard\":{\"cell_min_v\":null,\"cells_seen\":false,\"cell_block\":false}"));
+    in.cell_min_v = 3.2415f; in.cells_seen = true; d.flags = F_CELL_BLOCK | F_CELL_LOW;
+    m = state_to_json(sv, out, sizeof out);
+    CHECK(m > 0 && strstr(out, "\"guard\":{\"cell_min_v\":3.241,\"cells_seen\":true,\"cell_block\":true}") && strstr(out, "CELL_BLOCK"));
+    in.cell_min_v = kNaN; in.cells_seen = false; d.flags = F_HOLD;
     sv.epoch_s = -1; m = state_to_json(sv, out, sizeof out);
     CHECK(m > 0 && strstr(out, "\"ts\":null") && strstr(out, "\"ntp_synced\":false"));
     CHECK(state_to_json(sv, tiny, sizeof tiny) == 0);

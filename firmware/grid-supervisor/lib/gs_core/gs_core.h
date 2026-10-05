@@ -58,6 +58,9 @@ enum Flag : uint32_t {
     F_TIME_JUMP       = 1u << 14,  // обнаружен скачок/откат времени или большой пропуск шагов
     F_RELAY_MISMATCH  = 1u << 16,  // регистр 20105 и физическое реле расходятся (только алерт)
     F_LOAD_UNKNOWN    = 1u << 15,  // нагрузка в этом шаге неизвестна: «заряжено» не засчитывается
+    F_CELL_HARD       = 1u << 17,  // самая слабая ячейка <= cell_hard_floor_v (таймер dwell может ещё идти)
+    F_CELL_LOW        = 1u << 18,  // самая слабая ячейка <= cell_soft_on_v
+    F_CELL_BLOCK      = 1u << 19,  // отключение от сети заблокировано по ячейкам (ячейка ниже cell_off_min_v или данных нет при cell_guard=2)
 };
 
 struct Config {
@@ -66,6 +69,13 @@ struct Config {
     float soft_on_v    = 51.5f;      // <= этого дольше soft_on_dwell: подключить сеть
     float soft_off_v   = 53.3f;      // >= этого И заряд >= pow_min дольше soft_off_dwell: отключить
     float full_v       = 54.5f;      // >= этого дольше soft_off_dwell: отключить без условия по мощности
+
+    // --- защита по самой разряженной ячейке (В), данные приходят от BMS по CAN ---
+    float cell_hard_floor_v = 2.90f; // ячейка <= этого: подключить сеть как hard-floor (после hard_dwell)
+    float cell_soft_on_v    = 3.05f; // ячейка <= этого дольше soft_on_dwell: подключить сеть как soft-low
+    float cell_off_min_v    = 3.20f; // при свежих данных по ячейкам и ячейке НИЖЕ этого от сети НЕ отключаемся
+    uint8_t cell_guard      = 1;     // 0 — ячейки игнорируются; 1 — учитываются, когда данные свежие;
+                                     // 2 — как 1, и если ячейки в этом запуске были видны, а данных сейчас нет — от сети не отключаемся
 
     // --- времена (мс) ---
     uint32_t hard_dwell_ms       = 15000;    // фильтр одиночных выбросов; в safe-режиме тоже действует
@@ -111,6 +121,8 @@ struct Input {
     int8_t   relay_grid = -1;      // физическое реле сети (25238): -1 неизвестно, 0, 1
     int8_t   ongrid_reg = -1;      // прочитанное значение 20105: -1 неизвестно, 0, 1
     bool     safe_mode = false;    // включён safe-mode (петля перезагрузок)
+    float    cell_min_v = kNaN;    // напряжение самой слабой ячейки, В; NaN — нет свежих данных по ячейкам
+    bool     cells_seen = false;   // в этом запуске ячейки хоть раз были видны (для cell_guard = 2)
 
 };
 
@@ -168,6 +180,8 @@ private:
     int64_t  hard_since_ = kInactive;
     int64_t  soft_since_ = kInactive;
     int64_t  off_since_  = kInactive;
+    int64_t  cell_hard_since_ = kInactive;   // то же для ячейки (отдельные таймеры: данные приходят независимо от инвертора)
+    int64_t  cell_soft_since_ = kInactive;
 
     // состояние регистра 20105 и команд
     int8_t   last_reg_ = -1;

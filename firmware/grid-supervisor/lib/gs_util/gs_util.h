@@ -13,7 +13,7 @@ namespace gs {
 
 // Список полей Config, доступных для настройки. Имена — ключи JSON; в NVS пишем по индексу ("c00"...),
 // т.к. ключ NVS ограничен 15 символами.
-struct CfgField { const char* key; enum Kind { F32, U32 } kind; size_t off; };
+struct CfgField { const char* key; enum Kind { F32, U32, U8 } kind; size_t off; };
 extern const CfgField kCfgFields[];
 extern const size_t kCfgFieldCount;
 
