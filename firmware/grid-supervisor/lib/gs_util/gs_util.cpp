@@ -121,7 +121,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
     num(ch, sizeof ch, s.tel->chg_curr_a); num(ld, sizeof ld, s.tel->load_w); num(gv, sizeof gv, s.tel->grid_v);
     num(vu, sizeof vu, s.dec->v_used); num(ef, sizeof ef, s.dec->eff_charge_a); num(pm, sizeof pm, s.dec->pow_min_w);
     flags_to_str(s.dec->flags, fl, sizeof fl);
-    char bat[200];
+    char bat[320];
     if (!battery_brief_json(s.bat ? *s.bat : BatteryBrief(), bat, sizeof bat)) { if (cap) out[0] = 0; return 0; }
     if (s.epoch_s >= 0) {
         time_t t = (time_t)s.epoch_s; struct tm tmv;

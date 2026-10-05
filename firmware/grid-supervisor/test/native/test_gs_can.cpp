@@ -216,12 +216,12 @@ static void test_json() {
     // то же для краткой сводки
     char bj[200]; BatteryBrief br = battery_brief(b, 1500);
     size_t m = battery_brief_json(br, bj, sizeof bj);
-    CHECK(m > 0 && !strcmp(bj, "{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":true,\"alarm\":true,\"age_s\":0,\"i_abs\":null,\"protocol\":\"pylon\"}"));
+    CHECK(m > 0 && !strcmp(bj, "{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":true,\"alarm\":true,\"age_s\":0,\"i_abs\":null,\"protocol\":\"pylon\",\"cell_min_mv\":null,\"cell_max_mv\":null,\"cell_delta_mv\":null}"));
     bool all1 = true;
     for (size_t cap = 0; cap <= m; ++cap) if (battery_brief_json(br, bj, cap) != 0) all1 = false;
     CHECK(all1);
     CHECK(battery_brief_json(BatteryBrief(), bj, sizeof bj) > 0 &&
-          !strcmp(bj, "{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null,\"i_abs\":null,\"protocol\":null}"));
+          !strcmp(bj, "{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null,\"i_abs\":null,\"protocol\":null,\"cell_min_mv\":null,\"cell_max_mv\":null,\"cell_delta_mv\":null}"));
 }
 
 // ---- Seplos 100 кбит/с (29-битные ID, гипотезы по наблюдаемым кадрам) --------------------------------
@@ -259,7 +259,7 @@ static void test_seplos() {
     CHECK(r.protocol && !strcmp(r.protocol, "seplos_100k"));
     char bj[220];
     CHECK(battery_brief_json(r, bj, sizeof bj) > 0 && json_ok(bj) &&
-          !strcmp(bj, "{\"v\":53.90,\"i\":null,\"soc\":70,\"charge_en\":null,\"discharge_en\":null,\"alarm\":true,\"age_s\":1,\"i_abs\":11.1,\"protocol\":\"seplos_100k\"}"));
+          !strcmp(bj, "{\"v\":53.90,\"i\":null,\"soc\":70,\"charge_en\":null,\"discharge_en\":null,\"alarm\":true,\"age_s\":1,\"i_abs\":11.1,\"protocol\":\"seplos_100k\",\"cell_min_mv\":null,\"cell_max_mv\":null,\"cell_delta_mv\":null}"));
     // stale после 10 с (кадры 0x200 — 6000, остальные 5000)
     r = battery_brief(none, b, 5000 + 10000);
     CHECK(near(r.v, 53.9f) && r.alarm == 1);
@@ -321,6 +321,143 @@ static void test_mixed() {
     printf("can json, 24 ids + battery: %zu bytes (kCanJsonMax %zu)\n", n, (size_t)kCanJsonMax);
 }
 
+
+// ---- Seplos 500 кбит/с (стандартные ID 0x311…0x322, big-endian): реальные кадры ----------------------
+static const CanFrame q311 = fr(0x311, 1000, {0x02, 0x40, 0x07, 0x08, 0x07, 0x08, 0x00, 0x6A});
+static const CanFrame q312 = fr(0x312, 1000, {0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x10});
+static const CanFrame q313 = fr(0x313, 1000, {0x15, 0x01, 0x00, 0x3F, 0x01, 0x29, 0x48, 0x60});
+static const CanFrame q314 = fr(0x314, 1000, {0x52, 0x04, 0x71, 0x48, 0x00, 0x03, 0x01, 0x72});
+static const CanFrame q315 = fr(0x315, 1000, {0x0D, 0x1F, 0x0D, 0x20, 0x0D, 0x20, 0x0D, 0x20});
+static const CanFrame q316 = fr(0x316, 1000, {0x0D, 0x20, 0x0D, 0x21, 0x0D, 0x20, 0x0D, 0x22});
+static const CanFrame q317 = fr(0x317, 1000, {0x0D, 0x20, 0x0D, 0x21, 0x0D, 0x21, 0x0D, 0x21});
+static const CanFrame q318 = fr(0x318, 1000, {0x0D, 0x20, 0x0D, 0x20, 0x0D, 0x20, 0x0D, 0x20});
+static const CanFrame q319 = fr(0x319, 1000, {0xC0, 0x0D, 0x22, 0x0D, 0x1F, 0x01, 0x01, 0x00});
+static const CanFrame q320 = fr(0x320, 1000, {0x47, 0x54, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00});
+static const CanFrame q322 = fr(0x322, 1000, {0x01, 0x29, 0x01, 0x1D, 0x01, 0x01, 0x48, 0x48});
+static const CanFrame* const kQ[] = {&q311, &q312, &q313, &q314, &q315, &q316, &q317, &q318, &q319, &q320, &q322};
+
+static void test_seplos500() {
+    Seplos500Battery b;
+    for (const CanFrame* f : kQ) CHECK(b.feed(*f));
+    static const int mv[16] = {3359, 3360, 3360, 3360, 3360, 3361, 3360, 3362, 3360, 3361, 3361, 3361, 3360, 3360, 3360, 3360};
+    bool ok = true; for (int i = 0; i < 16; ++i) if (b.cells.mv[i] != mv[i] || !b.cell_ok(i, 1500)) ok = false;
+    CHECK(ok);
+    CHECK(near(b.pack.v, 53.77f) && b.pack.soc == 72 && b.pack.soh == 96 && near(b.pack.i_raw, 6.3f) && near(b.pack.temp_c, 29.7f));
+    CHECK(b.mm.max_mv == 3362 && b.mm.min_mv == 3359 && b.mm.b0 == 0xC0 && b.mm.idx[0] == 1 && b.mm.idx[1] == 1);
+    CHECK(near(b.limits.charge_v_limit, 57.6f) && near(b.limits.charge_a, 180.0f) && near(b.limits.discharge_a, 180.0f) && b.limits.unk == 0x006A);
+    CHECK(near(b.cap.remaining_ah, 209.96f) && near(b.cap.full_ah, 290.0f) && b.cap.counter == 3 && b.cap.cycles == 370);
+    CHECK(near(b.temps.max_c, 29.7f) && near(b.temps.min_c, 28.5f) && b.temps.unk[2] == 0x48);
+    CHECK(b.flags.raw[4] == 1 && b.flags.raw[7] == 0x10 && b.unk320.raw[0] == 0x47);
+    int mn = 0, mx = 0;
+    CHECK(b.cell_range(1500, &mn, &mx) && mn == 3359 && mx == 3362);
+    // сумма ячеек близка к напряжению пакета
+    int sum = 0; for (int i = 0; i < 16; ++i) sum += b.cells.mv[i];
+    CHECK(sum == 53765);
+    // расхождение 0x319 и массива: верим 0x319
+    Seplos500Battery c = b; c.feed(fr(0x319, 1000, {0xC0, 0x0D, 0x30, 0x0D, 0x10, 1, 1, 0}));
+    CHECK(c.cell_range(1500, &mn, &mx) && mn == 0x0D10 && mx == 0x0D30);
+    // второй снимок: 0x313 с другим током/SOC — старый кадр заменяется
+    CHECK(b.feed(fr(0x313, 6000, {0x15, 0x00, 0x00, 0x40, 0x01, 0x29, 0x49, 0x60})) && near(b.pack.v, 53.76f) && near(b.pack.i_raw, 6.4f) && b.pack.soc == 73 && b.pack.t_ms == 6000);
+    CHECK(b.feed(fr(0x314, 6000, {0x52, 0x04, 0x71, 0x48, 0x00, 0x02, 0x01, 0x72})) && b.cap.counter == 2);
+    // отрицательные значения: signed int16 (ток, температура)
+    CHECK(b.feed(fr(0x313, 7000, {0x15, 0x00, 0xFF, 0xC1, 0xFF, 0xF6, 0x48, 0x60})) && near(b.pack.i_raw, -6.3f) && near(b.pack.temp_c, -1.0f));
+    // непринимаемые кадры
+    Seplos500Battery e;
+    CHECK(!e.feed(fr(0x313, 1, {1, 2, 3, 4, 5, 6, 7}))                 // dlc 7
+          && !e.feed(fr(0x313, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true))    // расширенный
+          && !e.feed(fr(0x310, 1, {1, 2, 3, 4, 5, 6, 7, 8})) && !e.feed(fr(0x323, 1, {1, 2, 3, 4, 5, 6, 7, 8}))
+          && !e.feed(fr(0x321, 1, {1, 2, 3, 4, 5, 6, 7, 8})) && !e.feed(fr(0x351, 1, {1, 2, 3, 4, 5, 6, 7, 8}))
+          && !e.feed(s400) && !e.any());
+    // стандартный 0x351 по-прежнему в Pylon, а кадры 0x311… Pylon не принимает
+    PylonBattery p; CHECK(p.feed(k351) && !p.feed(q313) && !p.feed(q319));
+}
+
+static void test_seplos500_brief_json() {
+    Seplos500Battery b; PylonBattery none; SeplosBattery none2;
+    for (const CanFrame* f : kQ) b.feed(*f);
+    BatteryBrief r = battery_brief(none, none2, b, 3000);
+    CHECK(r.protocol && !strcmp(r.protocol, "seplos_500k") && near(r.v, 53.77f) && near(r.soc, 72) && std::isnan(r.i) && near(r.i_abs, 6.3f));
+    CHECK(r.cell_min_mv == 3359 && r.cell_max_mv == 3362 && r.cell_delta_mv == 3 && r.alarm < 0 && r.charge_en < 0 && r.age_s == 2);
+    char bj[320];
+    CHECK(battery_brief_json(r, bj, sizeof bj) > 0 && json_ok(bj) &&
+          !strcmp(bj, "{\"v\":53.77,\"i\":null,\"soc\":72,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":2,\"i_abs\":6.3,\"protocol\":\"seplos_500k\",\"cell_min_mv\":3359,\"cell_max_mv\":3362,\"cell_delta_mv\":3}"));
+    // двухдекодерная перегрузка на 500k не реагирует
+    CHECK(!battery_brief(none, none2, 3000).protocol);
+
+    CanStats st; for (const CanFrame* f : kQ) st.on_frame(*f);
+    CanDriverInfo d; d.enabled = true; d.speed_kbps = 500; d.ack = true; d.state = "running";
+    static char js[kCanJsonMax];
+    size_t n = can_to_json(d, st, none, none2, b, 3000, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && strlen(js) == n);
+    CHECK(strstr(js, "\"protocol\":\"seplos_500k\",\"confidence\":\"partial\",\"charge_v_max\":57.6,"));
+    CHECK(strstr(js, "\"soc\":72,\"soh\":96,\"soc10\":null,\"v\":53.77,\"i\":null,\"i_raw\":6.3,\"i_abs\":6.3,\"temp_c\":29.7,\"temp_max_c\":29.7,\"temp_min_c\":28.5,"));
+    CHECK(strstr(js, "\"cap_remaining_ah\":209.96,\"cap_full_ah\":290.00,\"cycles\":370,"));
+    CHECK(strstr(js, "\"cells_mv\":[3359,3360,3360,3360,3360,3361,3360,3362,3360,3361,3361,3361,3360,3360,3360,3360],\"cell_min_mv\":3359,\"cell_max_mv\":3362,\"cell_delta_mv\":3,"));
+    CHECK(strstr(js, "\"flags_raw\":\"00 00 00 00 01 00 00 10\"") && strstr(js, "\"f320\":\"47 54 0A 0A 00 00 00 00\"") && strstr(js, "\"f314_cnt\":3") && strstr(js, "\"f322\":\"01 01 48 48\""));
+    CHECK(strstr(js, "\"age_ms\":{\"cells\":2000,\"pack\":2000,") && strstr(js, "\"stale\":{\"cells\":false,\"pack\":false,"));
+    CHECK(strstr(js, "\"id\":\"0x313\",\"ext\":false"));
+    printf("seplos_500k /api/can json: %zu bytes (kCanJsonMax %zu)\n", n, (size_t)kCanJsonMax);
+
+    // stale: ровно 10 с ещё годно, 10,001 с — нет (всё null, кроме flags_raw/unk, которые тоже null)
+    n = can_to_json(d, st, none, none2, b, 1000 + 10000, js, sizeof js);
+    CHECK(n > 0 && strstr(js, "\"v\":53.77") && strstr(js, "\"cells_mv\":[3359") && strstr(js, "\"stale\":{\"cells\":false"));
+    BatteryBrief r2 = battery_brief(none, none2, b, 1000 + 10001);
+    CHECK(std::isnan(r2.v) && std::isnan(r2.soc) && r2.cell_min_mv < 0 && r2.cell_delta_mv < 0 && r2.protocol && r2.age_s == 10);
+    n = can_to_json(d, st, none, none2, b, 1000 + 10001, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && strstr(js, "\"v\":null,\"i\":null,\"i_raw\":null,\"i_abs\":null") && strstr(js, "\"cells_mv\":null,\"cell_min_mv\":null,\"cell_max_mv\":null,\"cell_delta_mv\":null") &&
+          strstr(js, "\"flags_raw\":null") && strstr(js, "\"cap_remaining_ah\":null") && strstr(js, "\"stale\":{\"cells\":true,\"pack\":true"));
+    // граница буфера
+    std::string tmp(n + 2, 'x'); tmp[n + 1] = '#';
+    CHECK(can_to_json(d, st, none, none2, b, 1000 + 10001, &tmp[0], n) == 0 && can_to_json(d, st, none, none2, b, 1000 + 10001, &tmp[0], n + 1) == n && tmp[n + 1] == '#');
+
+    // частичный набор: приходят только 0x315 и 0x317, пакета нет; остальные ячейки null, диапазон по 0x319 отсутствует
+    int mn = 0, mx = 0;
+    Seplos500Battery pp; pp.feed(q315); pp.feed(q317);
+    CHECK(!pp.cell_ok(4, 1500) && pp.cell_ok(0, 1500) && pp.cell_ok(8, 1500) && !pp.cell_range(1500, &mn, &mx));
+    n = can_to_json(d, st, none, none2, pp, 1500, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && strstr(js, "\"v\":null,") && strstr(js, "\"cells_mv\":[3359,3360,3360,3360,null,null,null,null,3360,3361,3361,3361,null,null,null,null],\"cell_min_mv\":null"));
+    CHECK(strstr(js, "\"age_ms\":{\"cells\":500,\"pack\":null,\"minmax\":null"));
+    // все 16 ячеек без 0x319: диапазон считается по массиву
+    Seplos500Battery cc; cc.feed(q315); cc.feed(q316); cc.feed(q317); cc.feed(q318);
+    r = battery_brief(none, none2, cc, 1500);
+    CHECK(r.cell_min_mv == 3359 && r.cell_max_mv == 3362 && r.cell_delta_mv == 3 && std::isnan(r.v));
+    // свежесть групп разная: 0x316 старый -> его ячейки null, остальные годны
+    cc.feed(fr(0x315, 20000, {0x0D, 0x1F, 0x0D, 0x20, 0x0D, 0x20, 0x0D, 0x20}));
+    CHECK(cc.cell_ok(0, 20500) && !cc.cell_ok(4, 20500) && !cc.cell_range(20500, &mn, &mx));
+}
+
+static void test_mixed3() {
+    // смесь трёх протоколов в одном потоке: побеждает самый свежий кадр; таблица ID раздельна для ext/std
+    PylonBattery p; SeplosBattery s; Seplos500Battery q; CanStats st;
+    const CanFrame seq[] = {k351, s100, s400, q313, q315, k356, q319, s500, q322, fr(0x00000313, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true), k355};
+    for (const CanFrame& f : seq) { st.on_frame(f); p.feed(f); s.feed(f); q.feed(f); }
+    CHECK(p.pack.have && s.pack.have && q.pack.have && !q.cells.have[1] && st.find(0x313, false) && st.find(0x313, true));
+    CHECK(!q.feed(fr(0x00000313, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true)) && !s.feed(q313) && !p.feed(q313));
+    // все кадры t=1000 или 5000: Seplos 100k (5000) свежее остальных
+    BatteryBrief r = battery_brief(p, s, q, 5500);
+    CHECK(r.protocol && !strcmp(r.protocol, "seplos_100k"));
+    q.feed(fr(0x313, 6000, {0x15, 0x01, 0x00, 0x3F, 0x01, 0x29, 0x48, 0x60}));
+    r = battery_brief(p, s, q, 6500);
+    CHECK(r.protocol && !strcmp(r.protocol, "seplos_500k") && near(r.v, 53.77f));
+    static char js[kCanJsonMax];
+    CanDriverInfo d; d.enabled = true; d.speed_kbps = 500;
+    CHECK(can_to_json(d, st, p, s, q, 6500, js, sizeof js) > 0 && json_ok(js) && strstr(js, "\"protocol\":\"seplos_500k\""));
+    p.feed(fr(0x356, 7000, {0x72, 0x14, 0xE0, 0xFF, 0xFD, 0x00}));
+    r = battery_brief(p, s, q, 7500);
+    CHECK(r.protocol && !strcmp(r.protocol, "pylon") && r.cell_min_mv < 0);
+    CHECK(can_to_json(d, st, p, s, q, 7500, js, sizeof js) > 0 && json_ok(js) && strstr(js, "\"protocol\":\"pylon\""));
+    // худший случай размера: 24 стандартных ID 0x311… + все поля 500k + полные данные других протоколов
+    Seplos500Battery w;
+    for (const CanFrame* f : kQ) w.feed(*f);
+    w.feed(fr(0x313, 1000, {0x95, 0x01, 0x80, 0x00, 0x81, 0x29, 0x64, 0x64}));
+    for (int i = 0; i < 16; ++i) w.cells.mv[i] = 65535;
+    w.cap.remaining_ah = w.cap.full_ah = 655.35f; w.cap.cycles = 65535;
+    CanStats full; for (uint32_t i = 0; i < 24; ++i) full.on_frame(fr(0x311 + i, 1000, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
+    size_t n = can_to_json(d, full, PylonBattery(), SeplosBattery(), w, 1500, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && n < kCanJsonMax - 300);
+    printf("can json worst case seplos_500k, 24 ids: %zu bytes (kCanJsonMax %zu)\n", n, (size_t)kCanJsonMax);
+}
+
 int main() {
     test_decode();
     test_alarm_names();
@@ -329,6 +466,9 @@ int main() {
     test_json();
     test_seplos();
     test_mixed();
+    test_seplos500();
+    test_seplos500_brief_json();
+    test_mixed3();
     printf("can: %d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -117,6 +117,67 @@ uint32_t SeplosBattery::last_ms() const {
     return best;
 }
 
+// ---- Seplos 500k: стандартные ID 0x311…0x322, u16 BIG-endian (уровни уверенности — в gs_can.h) ----
+static uint16_t be16(const uint8_t* p) { return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); }
+static int16_t sbe16(const uint8_t* p) { return (int16_t)be16(p); }
+
+bool Seplos500Battery::feed(const CanFrame& f) {
+    if (f.ext || f.id < kSeplos5IdFirst || f.id > kSeplos5IdLast || f.dlc < 8) return false;
+    const uint8_t* d = f.data;
+    switch (f.id) {
+    case 0x311:
+        limits.charge_v_limit = be16(d) * 0.1f; limits.charge_a = be16(d + 2) * 0.1f; limits.discharge_a = be16(d + 4) * 0.1f; limits.unk = be16(d + 6);
+        limits.have = true; limits.t_ms = f.t_ms; return true;
+    case 0x312:
+        memcpy(flags.raw, d, 8); flags.have = true; flags.t_ms = f.t_ms; return true;
+    case 0x313:
+        pack.v = be16(d) * 0.01f; pack.i_raw = sbe16(d + 2) * 0.1f; pack.temp_c = sbe16(d + 4) * 0.1f; pack.soc = d[6]; pack.soh = d[7];
+        pack.have = true; pack.t_ms = f.t_ms; return true;
+    case 0x314:
+        cap.remaining_ah = be16(d) * 0.01f; cap.full_ah = be16(d + 2) * 0.01f; cap.counter = be16(d + 4); cap.cycles = be16(d + 6);
+        cap.have = true; cap.t_ms = f.t_ms; return true;
+    case 0x315: case 0x316: case 0x317: case 0x318: {
+        const size_t g = f.id - 0x315;
+        for (size_t k = 0; k < 4; ++k) cells.mv[g * 4 + k] = be16(d + k * 2);
+        cells.have[g] = true; cells.t_ms[g] = f.t_ms; return true; }
+    case 0x319:
+        mm.b0 = d[0]; mm.max_mv = be16(d + 1); mm.min_mv = be16(d + 3); mm.idx[0] = d[5]; mm.idx[1] = d[6];
+        mm.have = true; mm.t_ms = f.t_ms; return true;
+    case 0x320:
+        memcpy(unk320.raw, d, 8); unk320.have = true; unk320.t_ms = f.t_ms; return true;
+    case 0x322:
+        temps.max_c = sbe16(d) * 0.1f; temps.min_c = sbe16(d + 2) * 0.1f; memcpy(temps.unk, d + 4, 4);
+        temps.have = true; temps.t_ms = f.t_ms; return true;
+    default: return false;                      // 0x321, 0x323… (в диапазоне, но не известны) — только в таблицу CanStats
+    }
+}
+
+bool Seplos500Battery::any() const {
+    return pack.have || mm.have || limits.have || cap.have || temps.have || flags.have || unk320.have ||
+           cells.have[0] || cells.have[1] || cells.have[2] || cells.have[3];
+}
+
+uint32_t Seplos500Battery::last_ms() const {
+    const struct { bool have; uint32_t t; } g[] = {{pack.have, pack.t_ms}, {mm.have, mm.t_ms}, {limits.have, limits.t_ms}, {cap.have, cap.t_ms},
+        {temps.have, temps.t_ms}, {flags.have, flags.t_ms}, {unk320.have, unk320.t_ms},
+        {cells.have[0], cells.t_ms[0]}, {cells.have[1], cells.t_ms[1]}, {cells.have[2], cells.t_ms[2]}, {cells.have[3], cells.t_ms[3]}};
+    bool got = false; uint32_t best = 0;
+    for (auto& x : g) if (x.have && (!got || (int32_t)(x.t - best) > 0)) { best = x.t; got = true; }
+    return best;
+}
+
+bool Seplos500Battery::cell_ok(size_t i, uint32_t now) const {
+    return i < 16 && can_fresh(cells.have[i / 4], cells.t_ms[i / 4], now);
+}
+
+bool Seplos500Battery::cell_range(uint32_t now, int* mn, int* mx) const {
+    if (can_fresh(mm.have, mm.t_ms, now)) { *mn = mm.min_mv; *mx = mm.max_mv; return true; }    // при расхождении с массивом верим 0x319
+    for (size_t i = 0; i < 16; ++i) if (!cell_ok(i, now)) return false;
+    *mn = *mx = cells.mv[0];
+    for (size_t i = 1; i < 16; ++i) { if (cells.mv[i] < *mn) *mn = cells.mv[i]; if (cells.mv[i] > *mx) *mx = cells.mv[i]; }
+    return true;
+}
+
 // Раскладка Pylontech low-voltage CAN, кадр 0x359 (из памяти, в PDF Seplos её нет — проверить на железе).
 static const char* const kProt1[8] = {nullptr, "Cell or module over-voltage", "Cell or module under-voltage", "Cell or module over-temperature",
                                       "Cell or module under-temperature", nullptr, nullptr, "Discharge over-current"};
@@ -135,7 +196,7 @@ const char* pylon_alarm_name(int byte, int bit) {
 }
 
 // ---- сводка ----------------------------------------------------------------------------------
-BatteryBrief::BatteryBrief() : v(std::numeric_limits<float>::quiet_NaN()), i(v), soc(v), i_abs(v), protocol(nullptr), charge_en(-1), discharge_en(-1), alarm(-1), age_s(-1) {}
+BatteryBrief::BatteryBrief() : v(std::numeric_limits<float>::quiet_NaN()), i(v), soc(v), i_abs(v), cell_min_mv(-1), cell_max_mv(-1), cell_delta_mv(-1), protocol(nullptr), charge_en(-1), discharge_en(-1), alarm(-1), age_s(-1) {}
 
 BatteryBrief battery_brief(const PylonBattery& b, uint32_t now) {
     BatteryBrief r;
@@ -159,15 +220,31 @@ static int pylon_last_ms(const PylonBattery& b, uint32_t* t) {
     for (auto& x : g) if (x.have && (!got || (int32_t)(x.t - *t) > 0)) { *t = x.t; got = true; }
     return got ? 0 : -1;
 }
-static int active_protocol(const PylonBattery& b, const SeplosBattery& s) {
-    uint32_t tp = 0;
-    bool hp = pylon_last_ms(b, &tp) == 0, hs = s.any();
-    if (hp && hs) return (int32_t)(s.last_ms() - tp) > 0 ? 1 : 0;
-    return hs ? 1 : hp ? 0 : -1;
+// Активный протокол: 0 — Pylon, 1 — seplos_100k, 2 — seplos_500k, -1 — кадров не было; побеждает кадр свежее (при равенстве Pylon, затем 100k).
+static int active_protocol(const PylonBattery& b, const SeplosBattery& s, const Seplos500Battery& s5) {
+    int best = -1; uint32_t bt = 0, t = 0;
+    if (pylon_last_ms(b, &t) == 0) { best = 0; bt = t; }
+    if (s.any()) { t = s.last_ms(); if (best < 0 || (int32_t)(t - bt) > 0) { best = 1; bt = t; } }
+    if (s5.any()) { t = s5.last_ms(); if (best < 0 || (int32_t)(t - bt) > 0) { best = 2; bt = t; } }
+    return best;
 }
 
 BatteryBrief battery_brief(const PylonBattery& b, const SeplosBattery& s, uint32_t now) {
-    if (active_protocol(b, s) != 1) return battery_brief(b, now);
+    return battery_brief(b, s, Seplos500Battery(), now);
+}
+
+BatteryBrief battery_brief(const PylonBattery& b, const SeplosBattery& s, const Seplos500Battery& s5, uint32_t now) {
+    const int ap = active_protocol(b, s, s5);
+    if (ap == 2) {
+        BatteryBrief r;
+        if (can_fresh(s5.pack.have, s5.pack.t_ms, now)) { r.v = s5.pack.v; r.i_abs = std::fabs(s5.pack.i_raw); r.soc = (float)s5.pack.soc; }    // i = NaN: знак тока не подтверждён
+        int mn, mx;
+        if (s5.cell_range(now, &mn, &mx)) { r.cell_min_mv = mn; r.cell_max_mv = mx; r.cell_delta_mv = mx - mn; }
+        r.age_s = (int32_t)(can_age_ms(s5.last_ms(), now) / 1000);
+        r.protocol = "seplos_500k";                // charge_en / discharge_en / alarm: -1 (раскладка флагов 0x312 неизвестна)
+        return r;
+    }
+    if (ap != 1) return battery_brief(b, now);
     BatteryBrief r;
     if (can_fresh(s.pack.have, s.pack.t_ms, now)) { r.v = s.pack.v; r.i_abs = s.pack.i_abs; }    // i остаётся NaN: знак неизвестен
     if (can_fresh(s.soc.have, s.soc.t_ms, now)) r.soc = (float)s.soc.soc;
@@ -227,10 +304,13 @@ size_t battery_brief_json(const BatteryBrief& b, char* out, size_t cap) {
     char v[16], i[16], s[16], ia[16];
     numstr(v, sizeof v, b.v, "%.2f"); numstr(i, sizeof i, b.i, "%.1f"); numstr(s, sizeof s, b.soc, "%.0f"); numstr(ia, sizeof ia, b.i_abs, "%.1f");
     char age[16]; if (b.age_s >= 0) snprintf(age, sizeof age, "%ld", (long)b.age_s); else snprintf(age, sizeof age, "null");
+    char cm[3][16];
+    const int32_t cv[3] = {b.cell_min_mv, b.cell_max_mv, b.cell_delta_mv};
+    for (int k = 0; k < 3; ++k) { if (cv[k] >= 0) snprintf(cm[k], 16, "%ld", (long)cv[k]); else snprintf(cm[k], 16, "null"); }
     W w(out, cap);
-    w.put("{\"v\":%s,\"i\":%s,\"soc\":%s,\"charge_en\":%s,\"discharge_en\":%s,\"alarm\":%s,\"age_s\":%s,\"i_abs\":%s,\"protocol\":%s%s%s}",
+    w.put("{\"v\":%s,\"i\":%s,\"soc\":%s,\"charge_en\":%s,\"discharge_en\":%s,\"alarm\":%s,\"age_s\":%s,\"i_abs\":%s,\"protocol\":%s%s%s,\"cell_min_mv\":%s,\"cell_max_mv\":%s,\"cell_delta_mv\":%s}",
           v, i, s, tfn(b.charge_en), tfn(b.discharge_en), tfn(b.alarm), age, ia,
-          b.protocol ? "\"" : "", b.protocol ? b.protocol : "null", b.protocol ? "\"" : "");
+          b.protocol ? "\"" : "", b.protocol ? b.protocol : "null", b.protocol ? "\"" : "", cm[0], cm[1], cm[2]);
     if (!w.ok) { if (cap) out[0] = 0; return 0; }
     return w.n;
 }
@@ -240,6 +320,83 @@ size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBatter
 }
 
 size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBattery& b, const SeplosBattery& sp, uint32_t now, char* out, size_t cap) {
+    return can_to_json(d, st, b, sp, Seplos500Battery(), now, out, cap);
+}
+
+namespace {
+// Блок battery для seplos_500k (после "stale_after_ms"). Уверенность: УВЕРЕННО — cells_mv, cell_min/max_mv, v, soc, soh;
+// СРЕДНЕ — temp_c, i_raw (знак не подтверждён), charge_v_max; guess — остальное (см. README). Поля, которых нет в кадрах, — null.
+void put_seplos500(W& w, const Seplos500Battery& q, uint32_t now) {
+    const bool fl = can_fresh(q.limits.have, q.limits.t_ms, now), fp = can_fresh(q.pack.have, q.pack.t_ms, now),
+               fm = can_fresh(q.mm.have, q.mm.t_ms, now), fc = can_fresh(q.cap.have, q.cap.t_ms, now),
+               ft = can_fresh(q.temps.have, q.temps.t_ms, now), ff = can_fresh(q.flags.have, q.flags.t_ms, now),
+               fu = can_fresh(q.unk320.have, q.unk320.t_ms, now);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    char c[14][16];
+    numstr(c[0], 16, fl ? q.limits.charge_v_limit : nan, "%.1f");
+    numstr(c[1], 16, fl ? q.limits.charge_a : nan, "%.1f");
+    numstr(c[2], 16, fl ? q.limits.discharge_a : nan, "%.1f");
+    numstr(c[3], 16, fp ? (float)q.pack.soc : nan, "%.0f");
+    numstr(c[4], 16, fp ? (float)q.pack.soh : nan, "%.0f");
+    numstr(c[5], 16, fp ? q.pack.v : nan, "%.2f");
+    numstr(c[6], 16, fp ? q.pack.i_raw : nan, "%.1f");
+    numstr(c[7], 16, fp ? std::fabs(q.pack.i_raw) : nan, "%.1f");
+    numstr(c[8], 16, fp ? q.pack.temp_c : nan, "%.1f");
+    numstr(c[9], 16, ft ? q.temps.max_c : nan, "%.1f");
+    numstr(c[10], 16, ft ? q.temps.min_c : nan, "%.1f");
+    numstr(c[11], 16, fc ? q.cap.remaining_ah : nan, "%.2f");
+    numstr(c[12], 16, fc ? q.cap.full_ah : nan, "%.2f");
+    if (fc) snprintf(c[13], 16, "%u", (unsigned)q.cap.cycles); else snprintf(c[13], 16, "null");
+    w.put(",\"protocol\":\"seplos_500k\",\"confidence\":\"partial\",\"charge_v_max\":%s,\"charge_a_max\":%s,\"discharge_a_max\":%s,\"discharge_v_min\":null,"
+          "\"soc\":%s,\"soh\":%s,\"soc10\":null,\"v\":%s,\"i\":null,\"i_raw\":%s,\"i_abs\":%s,\"temp_c\":%s,\"temp_max_c\":%s,\"temp_min_c\":%s,"
+          "\"cap_remaining_ah\":%s,\"cap_full_ah\":%s,\"cycles\":%s,",
+          c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13]);
+    // 16 ячеек: null вместо числа для ячеек без свежего кадра; весь массив null, если нет ни одной
+    bool anyc = false;
+    for (size_t i = 0; i < 16; ++i) if (q.cell_ok(i, now)) anyc = true;
+    w.put("\"cells_mv\":");
+    if (anyc) {
+        w.put("[");
+        for (size_t i = 0; i < 16; ++i) { if (i) w.put(","); if (q.cell_ok(i, now)) w.put("%u", (unsigned)q.cells.mv[i]); else w.put("null"); }
+        w.put("]");
+    } else w.put("null");
+    int mn = 0, mx = 0;
+    if (q.cell_range(now, &mn, &mx)) w.put(",\"cell_min_mv\":%d,\"cell_max_mv\":%d,\"cell_delta_mv\":%d", mn, mx, mx - mn);
+    else w.put(",\"cell_min_mv\":null,\"cell_max_mv\":null,\"cell_delta_mv\":null");
+    w.put(",\"charge_en\":null,\"discharge_en\":null,\"force_charge\":null,\"force_charge2\":null,\"full_charge_req\":null,\"req_raw\":null,"
+          "\"alarm\":null,\"protect\":null,\"alarms\":null,\"prot_raw\":null,\"modules\":null,\"mfr\":null,\"flags_raw\":");
+    if (ff) { w.put("\""); for (int k = 0; k < 8; ++k) w.put("%s%02X", k ? " " : "", (unsigned)q.flags.raw[k]); w.put("\""); } else w.put("null");
+    // сырьё неизвестных полей (только свежее)
+    w.put(",\"unk\":{\"f311\":");
+    if (fl) w.put("\"%02X %02X\"", (unsigned)(q.limits.unk >> 8), (unsigned)(q.limits.unk & 0xFF)); else w.put("null");
+    w.put(",\"f314_cnt\":"); if (fc) w.put("%u", (unsigned)q.cap.counter); else w.put("null");
+    w.put(",\"f319\":"); if (fm) w.put("\"%02X | %02X %02X\"", (unsigned)q.mm.b0, (unsigned)q.mm.idx[0], (unsigned)q.mm.idx[1]); else w.put("null");
+    w.put(",\"f320\":");
+    if (fu) { w.put("\""); for (int k = 0; k < 8; ++k) w.put("%s%02X", k ? " " : "", (unsigned)q.unk320.raw[k]); w.put("\""); } else w.put("null");
+    w.put(",\"f322\":");
+    if (ft) w.put("\"%02X %02X %02X %02X\"", (unsigned)q.temps.unk[0], (unsigned)q.temps.unk[1], (unsigned)q.temps.unk[2], (unsigned)q.temps.unk[3]); else w.put("null");
+    // возрасты/устаревание по группам кадров; ячейки: по самому старому из полученных кадров 0x315..0x318
+    bool anyh = false; uint32_t oldest = 0;
+    for (size_t g = 0; g < 4; ++g) if (q.cells.have[g]) { uint32_t a = can_age_ms(q.cells.t_ms[g], now); if (!anyh || a > oldest) oldest = a; anyh = true; }
+    w.put("},\"age_ms\":{\"cells\":"); if (anyh) w.put("%lu", (unsigned long)oldest); else w.put("null");
+    w.put(",\"pack\":"); put_age(w, q.pack.have, q.pack.t_ms, now);
+    w.put(",\"minmax\":"); put_age(w, q.mm.have, q.mm.t_ms, now);
+    w.put(",\"limits\":"); put_age(w, q.limits.have, q.limits.t_ms, now);
+    w.put(",\"cap\":"); put_age(w, q.cap.have, q.cap.t_ms, now);
+    w.put(",\"temps\":"); put_age(w, q.temps.have, q.temps.t_ms, now);
+    w.put(",\"flags\":"); put_age(w, q.flags.have, q.flags.t_ms, now);
+    w.put("},\"stale\":{\"cells\":"); if (anyh) w.put("%s", tf(oldest > kCanStaleMs)); else w.put("null");
+    w.put(",\"pack\":"); put_stale(w, q.pack.have, q.pack.t_ms, now);
+    w.put(",\"minmax\":"); put_stale(w, q.mm.have, q.mm.t_ms, now);
+    w.put(",\"limits\":"); put_stale(w, q.limits.have, q.limits.t_ms, now);
+    w.put(",\"cap\":"); put_stale(w, q.cap.have, q.cap.t_ms, now);
+    w.put(",\"temps\":"); put_stale(w, q.temps.have, q.temps.t_ms, now);
+    w.put(",\"flags\":"); put_stale(w, q.flags.have, q.flags.t_ms, now);
+    w.put("},\"pn_tag\":null}}");
+}
+}  // namespace
+
+size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBattery& b, const SeplosBattery& sp, const Seplos500Battery& s5, uint32_t now, char* out, size_t cap) {
     W w(out, cap);
     w.put("{\"enabled\":%s,\"speed_kbps\":%u,\"mode\":\"%s\",\"driver\":{\"state\":\"%s\",\"rx_msgs\":%lu,\"rx_missed\":%lu,"
           "\"bus_errors\":%lu,\"bus_off_count\":%lu,\"rx_err_counter\":%lu},\"frames_total\":%lu,\"ids_overflow\":%lu,\"ids\":[",
@@ -256,7 +413,13 @@ size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBatter
         w.put(",\"age_ms\":%lu,\"dlc\":%u,\"data\":\"%s\"}", (unsigned long)can_age_ms(s.last_ms, now), (unsigned)s.dlc, data);
     }
     w.put("],\"battery\":{\"stale_after_ms\":%lu", (unsigned long)kCanStaleMs);
-    if (active_protocol(b, sp) == 1) {
+    const int ap = active_protocol(b, sp, s5);
+    if (ap == 2) {
+        put_seplos500(w, s5, now);
+        if (!w.ok) { if (cap) out[0] = 0; return 0; }
+        return w.n;
+    }
+    if (ap == 1) {
         // Seplos 100k: все раскладки — гипотезы (confidence = "guess"); поля, которых в этих кадрах нет, — null
         const bool fl = can_fresh(sp.limits.have, sp.limits.t_ms, now), fs = can_fresh(sp.soc.have, sp.soc.t_ms, now),
                    fp = can_fresh(sp.pack.have, sp.pack.t_ms, now), fx = can_fresh(sp.prot.have, sp.prot.t_ms, now);
@@ -290,7 +453,7 @@ size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBatter
         if (!w.ok) { if (cap) out[0] = 0; return 0; }
         return w.n;
     }
-    w.put(",\"protocol\":%s,\"confidence\":null,\"soc10\":null,\"i_abs\":null", active_protocol(b, sp) == 0 ? "\"pylon\"" : "null");
+    w.put(",\"protocol\":%s,\"confidence\":null,\"soc10\":null,\"i_abs\":null", ap == 0 ? "\"pylon\"" : "null");
 
     const bool fl = can_fresh(b.limits.have, b.limits.t_ms, now), fs = can_fresh(b.soc.have, b.soc.t_ms, now),
                fp = can_fresh(b.pack.have, b.pack.t_ms, now), fr = can_fresh(b.req.have, b.req.t_ms, now),

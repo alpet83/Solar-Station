@@ -36,6 +36,7 @@ static SemaphoreHandle_t g_mtx;
 static gs::CanStats g_stats;
 static gs::PylonBattery g_bat;             // Pylon-совместимый протокол (11-бит ID)
 static gs::SeplosBattery g_sep;           // реальный протокол Seplos 100 кбит/с (29-бит ID, гипотеза)
+static gs::Seplos500Battery g_sep5;       // «Pylon CAN» режим BMS на деле: 500 кбит/с, стандартные ID 0x311…0x322, big-endian (гипотеза)
 static gs::CanDriverInfo g_info;
 static uint32_t g_base_missed = 0, g_base_errs = 0;     // счётчики прежней установки драйвера (после переустановки после сбоя)
 
@@ -70,7 +71,7 @@ static void apply(int want) {
     digitalWrite(GS_CAN_SE, want ? GS_CAN_SE_ON : GS_CAN_SE_OFF);
     if (want) g_installed = drv_install(want);
     xSemaphoreTake(g_mtx, portMAX_DELAY);
-    g_stats.clear(); g_bat = gs::PylonBattery(); g_sep = gs::SeplosBattery();
+    g_stats.clear(); g_bat = gs::PylonBattery(); g_sep = gs::SeplosBattery(); g_sep5 = gs::Seplos500Battery();
     g_base_missed = g_base_errs = 0;
     g_info = gs::CanDriverInfo();
     g_info.enabled = want != 0; g_info.speed_kbps = (uint16_t)want; g_info.ack = g_ack.load() || g_hb.load(); g_info.hb = g_hb.load();
@@ -127,7 +128,7 @@ static void can_task(void*) {
             f.dlc = m.data_length_code > 8 ? 8 : m.data_length_code;
             memcpy(f.data, m.data, f.dlc);
             xSemaphoreTake(g_mtx, portMAX_DELAY);
-            g_stats.on_frame(f); g_bat.feed(f); g_sep.feed(f); ++g_info.rx_msgs;
+            g_stats.on_frame(f); g_bat.feed(f); g_sep.feed(f); g_sep5.feed(f); ++g_info.rx_msgs;
             xSemaphoreGive(g_mtx);
             if (millis() - hk >= 500) break;
         }
@@ -166,13 +167,13 @@ int speed() { return g_want.load(); }
 
 void brief(gs::BatteryBrief& out) {
     if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(50))) return;
-    out = gs::battery_brief(g_bat, g_sep, ms32());
+    out = gs::battery_brief(g_bat, g_sep, g_sep5, ms32());
     xSemaphoreGive(g_mtx);
 }
 
 size_t api_json(char* out, size_t cap) {
     if (!g_mtx || !xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) return 0;
-    size_t n = gs::can_to_json(g_info, g_stats, g_bat, g_sep, ms32(), out, cap);
+    size_t n = gs::can_to_json(g_info, g_stats, g_bat, g_sep, g_sep5, ms32(), out, cap);
     xSemaphoreGive(g_mtx);
     return n;
 }
