@@ -265,10 +265,12 @@ static void h_can() {
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
 }
 
-// POST /api/can  [speed=0|100|125|250|500] [ack=0|1] — скорость CAN-сниффера, кбит/с (0 = выключить) и подтверждение кадров (ACK); сохраняется в NVS.
+// POST /api/can  [speed=0|100|125|250|500] [ack=0|1] [hb=0|1] — скорость CAN-сниффера, кбит/с (0 = выключить) и подтверждение кадров (ACK); сохраняется в NVS.
 static void h_can_set() {
     if (!authed(true)) return;
-    if (g_http.hasArg("ack")) { String a = g_http.arg("ack"); if (a != "0" && a != "1") { g_http.send(400, "text/plain", "ack must be 0 or 1"); return; } canrx::set_ack(a == "1"); if (!g_http.hasArg("speed")) { g_http.send(200, "text/plain", "ok"); return; } }
+    if (g_http.hasArg("hb")) { String h = g_http.arg("hb"); if (h != "0" && h != "1") { g_http.send(400, "text/plain", "hb must be 0 or 1"); return; } canrx::set_heartbeat(h == "1"); }
+    if (g_http.hasArg("ack")) { String a = g_http.arg("ack"); if (a != "0" && a != "1") { g_http.send(400, "text/plain", "ack must be 0 or 1"); return; } canrx::set_ack(a == "1"); }
+    if (!g_http.hasArg("speed")) { g_http.send(200, "text/plain", "ok"); return; }
     String v = g_http.arg("speed");
     if (v != "0" && v != "100" && v != "125" && v != "250" && v != "500") { g_http.send(400, "text/plain", "speed must be 0, 100, 125, 250 or 500"); return; }
     canrx::set_speed(v.toInt());

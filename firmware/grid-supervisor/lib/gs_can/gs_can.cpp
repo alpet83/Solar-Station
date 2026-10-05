@@ -243,7 +243,7 @@ size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBatter
     W w(out, cap);
     w.put("{\"enabled\":%s,\"speed_kbps\":%u,\"mode\":\"%s\",\"driver\":{\"state\":\"%s\",\"rx_msgs\":%lu,\"rx_missed\":%lu,"
           "\"bus_errors\":%lu,\"bus_off_count\":%lu,\"rx_err_counter\":%lu},\"frames_total\":%lu,\"ids_overflow\":%lu,\"ids\":[",
-          tf(d.enabled), (unsigned)d.speed_kbps, d.ack ? "normal_ack" : "listen_only", d.state, (unsigned long)d.rx_msgs, (unsigned long)d.rx_missed,
+          tf(d.enabled), (unsigned)d.speed_kbps, d.hb ? "normal_ack_heartbeat" : d.ack ? "normal_ack" : "listen_only", d.state, (unsigned long)d.rx_msgs, (unsigned long)d.rx_missed,
           (unsigned long)d.bus_errors, (unsigned long)d.bus_off_count, (unsigned long)d.rx_err_counter,
           (unsigned long)st.total(), (unsigned long)st.overflow());
     for (size_t k = 0; k < st.size(); ++k) {

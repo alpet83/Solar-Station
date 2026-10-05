@@ -27,6 +27,9 @@ namespace canrx {
 static std::atomic<int> g_want{500};         // заданная скорость, кбит/с (0 = выключено)
 static std::atomic<bool> g_ack{false};      // подтверждать кадры (ACK) вместо чистого listen-only
 static bool g_cur_ack = false;
+static std::atomic<bool> g_hb{false};       // раз в секунду слать 0x305 (имитация «жив» инвертора), по умолчанию выключено
+static bool g_cur_hb = false;
+static uint32_t g_hb_ms = 0;
 static int g_cur = -1;                       // применённая задачей (-1 — ещё ничего)
 static bool g_installed = false;
 static SemaphoreHandle_t g_mtx;
@@ -39,9 +42,9 @@ static uint32_t g_base_missed = 0, g_base_errs = 0;     // счётчики пр
 static uint32_t ms32() { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 static bool drv_install(int kbps) {
-    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)GS_CAN_TX, (gpio_num_t)GS_CAN_RX, g_ack.load() ? TWAI_MODE_NORMAL : TWAI_MODE_LISTEN_ONLY);
+    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)GS_CAN_TX, (gpio_num_t)GS_CAN_RX, (g_ack.load() || g_hb.load()) ? TWAI_MODE_NORMAL : TWAI_MODE_LISTEN_ONLY);
     g.rx_queue_len = 32;
-    g.tx_queue_len = 0;                      // очередь передачи отключена: передавать нечем
+    g.tx_queue_len = g_hb.load() ? 2 : 0;    // очередь передачи нужна только для «жив» 0x305; без него передавать нечем
     twai_timing_config_t t250 = TWAI_TIMING_CONFIG_250KBITS();
     twai_timing_config_t t500 = TWAI_TIMING_CONFIG_500KBITS();
     twai_timing_config_t t125 = TWAI_TIMING_CONFIG_125KBITS();
@@ -70,10 +73,10 @@ static void apply(int want) {
     g_stats.clear(); g_bat = gs::PylonBattery(); g_sep = gs::SeplosBattery();
     g_base_missed = g_base_errs = 0;
     g_info = gs::CanDriverInfo();
-    g_info.enabled = want != 0; g_info.speed_kbps = (uint16_t)want; g_info.ack = g_ack.load();
+    g_info.enabled = want != 0; g_info.speed_kbps = (uint16_t)want; g_info.ack = g_ack.load() || g_hb.load(); g_info.hb = g_hb.load();
     g_info.state = !want ? "off" : g_installed ? "running" : "error";
     xSemaphoreGive(g_mtx);
-    g_cur = want; g_cur_ack = g_ack.load();
+    g_cur = want; g_cur_ack = g_ack.load(); g_cur_hb = g_hb.load();
     Serial.printf("can: %s%s\n", !want ? "off" : g_installed ? (want == 100 ? "listen-only 100 kbit/s" : want == 125 ? "listen-only 125 kbit/s" : want == 250 ? "listen-only 250 kbit/s" : "listen-only 500 kbit/s") : "driver install FAILED, will retry", want && g_cur_ack ? " (+ACK)" : "");
 }
 
@@ -104,12 +107,17 @@ static void can_task(void*) {
     uint32_t hk = 0, retry = 0;
     for (;;) {
         const int want = g_want.load();
-        if (want != g_cur || g_ack.load() != g_cur_ack) { apply(want); retry = millis(); }
+        if (want != g_cur || g_ack.load() != g_cur_ack || g_hb.load() != g_cur_hb) { apply(want); retry = millis(); }
         if (!want) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
         if (!g_installed) {                                             // установка не удалась: повтор раз в 5 с
             vTaskDelay(pdMS_TO_TICKS(200));
             if (millis() - retry > 5000) { retry = millis(); g_installed = drv_install(want); if (g_installed) { xSemaphoreTake(g_mtx, portMAX_DELAY); g_info.state = "running"; xSemaphoreGive(g_mtx); } }
             continue;
+        }
+        if (g_hb.load() && g_cur_hb && millis() - g_hb_ms >= 1000) {     // «жив» инвертора: Pylon/Seplos 0x305, 8 нулевых байт
+            g_hb_ms = millis();
+            twai_message_t hb = {}; hb.identifier = 0x305; hb.data_length_code = 8;
+            twai_transmit(&hb, 0);
         }
         twai_message_t m;
         while (twai_receive(&m, pdMS_TO_TICKS(100)) == ESP_OK) {
@@ -132,7 +140,7 @@ void begin() {
     Preferences p; p.begin("gs", true);
     uint32_t v = p.getUInt("can", 500);
     p.end();
-    { Preferences q; q.begin("gs", true); g_ack.store(q.getBool("canack", false)); q.end(); }
+    { Preferences q; q.begin("gs", true); g_hb.store(q.getBool("canhb", false)); g_ack.store(q.getBool("canack", false)); q.end(); }
     g_want.store(v == 0 || v == 100 || v == 125 || v == 250 ? (int)v : 500);
     xTaskCreatePinnedToCore(can_task, "gs_can", 4096, nullptr, 2, nullptr, 0);
 }
@@ -148,6 +156,11 @@ void set_ack(bool on) {
     g_ack.store(on);
 }
 bool ack() { return g_ack.load(); }
+void set_heartbeat(bool on) {
+    Preferences p; p.begin("gs", false); p.putBool("canhb", on); p.end();
+    g_hb.store(on);
+}
+bool heartbeat() { return g_hb.load(); }
 
 int speed() { return g_want.load(); }
 
@@ -170,7 +183,7 @@ void status_line(char* out, size_t cap) {
     const int want = g_want.load();
     if (!want) { snprintf(out, cap, "can: off"); return; }
     snprintf(out, cap, "can: %d kbit/s %s, state=%s rx=%lu missed=%lu bus_err=%lu bus_off=%lu",
-             want, g_ack.load() ? "normal (ACK)" : "listen-only", d.state, (unsigned long)d.rx_msgs, (unsigned long)d.rx_missed, (unsigned long)d.bus_errors, (unsigned long)d.bus_off_count);
+             want, g_hb.load() ? "normal (ACK + heartbeat 0x305)" : g_ack.load() ? "normal (ACK)" : "listen-only", d.state, (unsigned long)d.rx_msgs, (unsigned long)d.rx_missed, (unsigned long)d.bus_errors, (unsigned long)d.bus_off_count);
 }
 
 }  // namespace canrx

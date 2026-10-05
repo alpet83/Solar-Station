@@ -10,6 +10,8 @@ void begin();                        // читает скорость из NVS �
 void set_speed(int kbps);            // 0 = выключить, 250 или 500; сохраняет в NVS, применяет задача CAN (счётчики сбрасываются)
 void set_ack(bool on);              // true: подтверждать кадры (ACK); сохраняется в NVS (BMS без других узлов иначе повторяет кадры вечно)
 bool ack();
+void set_heartbeat(bool on);        // true: раз в секунду слать кадр 0x305 (8 нулей) как «жив» инвертора; включает ACK; сохраняется в NVS
+bool heartbeat();
 int speed();                         // заданная скорость (0 = выключен)
 void brief(gs::BatteryBrief& out);   // сводка для /api/state
 size_t api_json(char* out, size_t cap);          // JSON для /api/can; 0 — нет данных/не влезло
