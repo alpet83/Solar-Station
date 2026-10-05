@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "gs_cli.h"
+#include "can_rx.h"
 
 #include <Preferences.h>
 #include <Update.h>
@@ -163,12 +164,13 @@ static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 
 static void h_state() {
     // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
-    static char buf[2800];
+    static char buf[3072];     // худший случай (8 событий + батарея) ~1.7 КБ
     static Snapshot s;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
     s = g_snap; xSemaphoreGive(g_mtx);
+    gs::BatteryBrief bb; canrx::brief(bb);
     gs::StateView v{&s.tel, &s.dec, &s.in, s.uptime_ms, s.seq, g_boot_id, s.safe_mode, epoch_or_neg(),
-                    s.paused, s.pause_left_ms, s.rx_ok, s.rx_err, s.rx_foreign, s.rx_busy, s.rx_exc, s.events, s.n_events, s.sniff_only};
+                    s.paused, s.pause_left_ms, s.rx_ok, s.rx_err, s.rx_foreign, s.rx_busy, s.rx_exc, s.events, s.n_events, s.sniff_only, &bb};
     size_t n = gs::state_to_json(v, buf, sizeof buf);
     g_http.sendHeader("Cache-Control", "no-store");
     g_http.send(n ? 200 : 500, "application/json", n ? buf : "{}");
@@ -253,6 +255,16 @@ static void h_sniff() {
     free(buf);
 }
 
+// GET /api/can — пассивный CAN-сниффер: драйвер, таблица по ID, декодированная батарея (Pylon-кадры BMS).
+static void h_can() {
+    // чтение открыто без пароля (в API нет секретов); скорость меняется только по консоли
+    touch_api();
+    static char buf[gs::kCanJsonMax];
+    size_t n = canrx::api_json(buf, sizeof buf);
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
+}
+
 // POST /api/logger  period_s=30..900 — ожидаемый период пачек даталоггера (сбрасывает захват ритма).
 static void h_logger() {
     if (!authed(true)) return;
@@ -304,7 +316,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
@@ -591,7 +603,9 @@ static void cli_exec(const gs::CliCmd& c) {
     case CliKind::None: break;
     case CliKind::Error: Serial.printf("error: %s\n", c.err); break;
     case CliKind::Help: Serial.print(gs::cli_help_text()); break;
-    case CliKind::Status: Serial.println(net_status_line(true)); Serial.printf("rev %s, mode %s, uptime %lu s\n", kRev, g_sniff_only.load() ? "sniff" : "normal", (unsigned long)(now_ms() / 1000)); break;
+    case CliKind::Status: Serial.println(net_status_line(true)); Serial.printf("rev %s, mode %s, uptime %lu s\n", kRev, g_sniff_only.load() ? "sniff" : "normal", (unsigned long)(now_ms() / 1000));
+        { char cb[160]; canrx::status_line(cb, sizeof cb); Serial.println(cb); }
+        break;
     case CliKind::Nets:
         for (int k = 0; k < kNets; ++k) {
             if (!g_ssid[k].length()) { Serial.printf("%d. (empty)\n", k + 1); continue; }
@@ -640,6 +654,10 @@ static void cli_exec(const gs::CliCmd& c) {
         if (c.flag >= 0) g_serial_log.store(c.flag == 1);
         Serial.printf("log: %s\n", g_serial_log.load() ? "on" : "off");
         break;
+    case CliKind::Can:
+        if (c.flag == 1) { canrx::set_speed((int)c.num); Serial.println("can: saved, applying (counters reset)"); }
+        { char cb[160]; canrx::status_line(cb, sizeof cb); Serial.println(cb); }
+        break;
     case CliKind::Scan: {
         Serial.println("scanning...");
         int n = WiFi.scanNetworks(false, true);
@@ -667,6 +685,7 @@ static void cli_exec(const gs::CliCmd& c) {
         v = p.getString("xtok", ""); if (v.length()) Serial.printf("token %s\n", q(v).c_str());
         Serial.printf("logger %u\n", (unsigned)g_lg_period_s.load());
         Serial.printf("mode %s\n", g_sniff_only.load() ? "sniff" : "normal");
+        if (canrx::speed()) Serial.printf("can %d\n", canrx::speed()); else Serial.println("can off");
         p.end();
         break; }
     case CliKind::ExtToken: { Preferences p; p.begin("gs", false); p.putString("xtok", c.a); p.end(); g_xtok = c.a; Serial.println("ext token saved"); break; }
@@ -707,6 +726,7 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/ext", HTTP_POST, h_ext);
     g_http.on("/api/cmd", HTTP_POST, h_cmd);
     g_http.on("/api/sniff", HTTP_GET, h_sniff);
+    g_http.on("/api/can", HTTP_GET, h_can);
     g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/api/logger", HTTP_POST, h_logger);
     g_http.on("/setup", HTTP_ANY, h_setup);

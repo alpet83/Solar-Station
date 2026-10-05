@@ -96,6 +96,24 @@ static void test_new() {
     CHECK(is_err(cli_parse("token", 4)));
 }
 
+static void test_can() {
+    CliCmd c = cli_parse("can", 4);
+    CHECK(c.kind == CliKind::Can && c.flag == -1);
+    c = cli_parse("can off", 4);
+    CHECK(c.kind == CliKind::Can && c.flag == 1 && c.num == 0);
+    c = cli_parse("CAN OFF", 4);
+    CHECK(c.kind == CliKind::Can && c.flag == 1 && c.num == 0);
+    c = cli_parse("can 250", 4);
+    CHECK(c.kind == CliKind::Can && c.flag == 1 && c.num == 250);
+    c = cli_parse("can 500", 4);
+    CHECK(c.kind == CliKind::Can && c.flag == 1 && c.num == 500);
+    CHECK(is_err(cli_parse("can 125", 4)));
+    CHECK(is_err(cli_parse("can 0500", 4)));
+    CHECK(is_err(cli_parse("can on", 4)));
+    CHECK(is_err(cli_parse("can 500 250", 4)));
+    CHECK(is_err(cli_parse("can \"500\"", 4)));
+}
+
 static void test_line() {
     CliLine l;
     auto feed_all = [&](const char* s, std::string& out) {
@@ -130,8 +148,9 @@ static void test_sniff_policy() {
 }
 
 int main() {
-    test_simple(); test_net(); test_new(); test_other(); test_line(); test_sniff_policy();
+    test_simple(); test_net(); test_new(); test_can(); test_other(); test_line(); test_sniff_policy();
     CHECK(strstr(cli_help_text(), "net <1..4>") != nullptr);
+    CHECK(strstr(cli_help_text(), "can [off|250|500]") != nullptr);
     printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;
 }

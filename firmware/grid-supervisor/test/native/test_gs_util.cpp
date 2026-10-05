@@ -57,6 +57,29 @@ int main() {
         printf("%s\n", big);
     }
 
+    // батарея по CAN в /api/state: объект с null-ами без данных, значения при свежих данных
+    {
+        Event ev[kEventCap];
+        for (size_t i = 0; i < kEventCap; ++i) { ev[i].id = 4000000000u + (uint32_t)i; ev[i].cmd = Cmd::Disconnect; ev[i].reason = Reason::SafeMode; ev[i].epoch_s = 1790826665; ev[i].v = 51.23f; ev[i].uptime_ms = 99999999999ull; ev[i].ok = true; }
+        sv.events = ev; sv.n_events = kEventCap; sv.epoch_s = 1790826665;
+        static char big[3000];
+        size_t k = state_to_json(sv, big, sizeof big);
+        CHECK(k > 0 && strstr(big, "\"battery\":{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null},\"events\":["));
+        PylonBattery pb; CanFrame f; f.t_ms = 1000;
+        f.id = 0x356; f.dlc = 6; f.data[0] = 0x72; f.data[1] = 0x14; f.data[2] = 0xE0; f.data[3] = 0xFF; pb.feed(f);
+        f.id = 0x355; f.dlc = 4; f.data[0] = 87; f.data[1] = 0; pb.feed(f);
+        f.id = 0x35C; f.dlc = 2; f.data[0] = 0x80; pb.feed(f);
+        f.id = 0x359; f.dlc = 7; f.data[0] = 0x00; f.data[1] = 0; f.data[2] = 0; f.data[3] = 0; f.data[4] = 1; pb.feed(f);
+        BatteryBrief bb = battery_brief(pb, 3500);
+        sv.bat = &bb;
+        k = state_to_json(sv, big, sizeof big);
+        CHECK(k > 0 && big[k - 1] == '}' && strlen(big) == k && strstr(big, "\"battery\":{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":false,\"alarm\":false,\"age_s\":2}"));
+        printf("state json with 8 events + battery: %zu bytes (shell buffer 3072)\n", k);
+        CHECK(k < 3072 - 400);
+        CHECK(state_to_json(sv, big, k) == 0 && state_to_json(sv, big, k + 1) == k);   // граница буфера
+        sv.bat = nullptr; sv.n_events = 0; sv.events = nullptr;
+    }
+
     // атомарный набор: сдвиг всех порогов, недостижимый пошагово от значений по умолчанию
     {
         Config d; const char* k[] = {"hard_floor_v", "soft_on_v", "soft_off_v", "full_v"};

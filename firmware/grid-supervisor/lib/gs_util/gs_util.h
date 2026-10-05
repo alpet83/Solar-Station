@@ -7,6 +7,7 @@
 #include "gs_core.h"
 #include "gs_bus.h"
 #include "gs_modbus.h"
+#include "gs_can.h"
 
 namespace gs {
 
@@ -46,6 +47,7 @@ struct StateView {
     uint32_t rx_ok, rx_err, rx_foreign, rx_busy, rx_exc;
     const Event* events = nullptr; size_t n_events = 0;     // от новых к старым
     bool sniff_only = false;                                // режим «только приём»: управление сетью выключено
+    const BatteryBrief* bat = nullptr;                      // сводка батареи по CAN; nullptr = объект с null-полями
 };
 // JSON состояния. Время — UTC: epoch в "t" и ISO в "ts" (только если epoch_s >= 0).
 size_t state_to_json(const StateView& s, char* out, size_t cap);

@@ -5,15 +5,15 @@
 
 namespace gs {
 
-enum class CliKind { None, Help, Status, Nets, NetSet, NetDel, Host, ApPass, AdminPass, Mode, Logger, Log, Reboot, Scan, Export, ExtToken, Error };
+enum class CliKind { None, Help, Status, Nets, NetSet, NetDel, Host, ApPass, AdminPass, Mode, Logger, Log, Can, Reboot, Scan, Export, ExtToken, Error };
 
 struct CliCmd {
     CliKind kind = CliKind::None;
     int net = 0;               // NetSet/NetDel: номер сети 1..max_nets
     char a[80] = {0};          // SSID / имя хоста / пароль / слово режима
     char b[80] = {0};          // пароль сети (пусто = открытая сеть)
-    long num = 0;              // Logger: период, с
-    int flag = -1;             // Mode: 0 = normal, 1 = sniff, -1 = только показать; Log: 0/1, -1 = показать
+    long num = 0;              // Logger: период, с; Can: скорость, кбит/с (0 = выключен)
+    int flag = -1;             // Mode: 0 = normal, 1 = sniff, -1 = только показать; Log: 0/1, -1 = показать; Can: 1 = задать (num), -1 = показать
     char err[64] = {0};        // Error: текст
 };
 

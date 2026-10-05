@@ -121,6 +121,8 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
     num(ch, sizeof ch, s.tel->chg_curr_a); num(ld, sizeof ld, s.tel->load_w); num(gv, sizeof gv, s.tel->grid_v);
     num(vu, sizeof vu, s.dec->v_used); num(ef, sizeof ef, s.dec->eff_charge_a); num(pm, sizeof pm, s.dec->pow_min_w);
     flags_to_str(s.dec->flags, fl, sizeof fl);
+    char bat[160];
+    if (!battery_brief_json(s.bat ? *s.bat : BatteryBrief(), bat, sizeof bat)) { if (cap) out[0] = 0; return 0; }
     if (s.epoch_s >= 0) {
         time_t t = (time_t)s.epoch_s; struct tm tmv;
         gmtime_r(&t, &tmv);
@@ -133,7 +135,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         "\"ongrid_reg\":%d,\"relay_grid\":%d,\"rt_ok\":%s,\"chg_ok\":%s,\"cfg_ok\":%s,"
         "\"decision\":{\"v_used\":%s,\"eff_charge_a\":%s,\"pow_min_w\":%s,\"flags\":\"%s\",\"flags_raw\":%lu},"
         "\"mode\":\"%s\",\"safe_mode\":%s,\"paused\":%s,\"pause_left_s\":%llu,"
-        "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu},\"events\":[",
+        "\"bus\":{\"ok\":%lu,\"err\":%lu,\"foreign\":%lu,\"busy\":%lu,\"exc\":%lu},\"battery\":%s,\"events\":[",
         (unsigned long)s.seq, (unsigned long)s.boot_id, (unsigned long long)s.uptime_ms,
         s.epoch_s >= 0 ? "true" : "false", (long long)s.epoch_s,
         s.epoch_s >= 0 ? "\"" : "", s.epoch_s >= 0 ? ts : "null", s.epoch_s >= 0 ? "\"" : "",
@@ -142,7 +144,7 @@ size_t state_to_json(const StateView& s, char* out, size_t cap) {
         vu, ef, pm, fl, (unsigned long)s.dec->flags,
         s.sniff_only ? "sniff" : "normal", s.safe_mode ? "true" : "false", s.paused ? "true" : "false", (unsigned long long)(s.pause_left_ms / 1000),
         (unsigned long)s.rx_ok, (unsigned long)s.rx_err, (unsigned long)s.rx_foreign, (unsigned long)s.rx_busy,
-        (unsigned long)s.rx_exc);
+        (unsigned long)s.rx_exc, bat);
     if (w < 0 || (size_t)w >= cap) { if (cap) out[0] = 0; return 0; }
     size_t n = (size_t)w;
     for (size_t i = 0; i < s.n_events && s.events; ++i) {

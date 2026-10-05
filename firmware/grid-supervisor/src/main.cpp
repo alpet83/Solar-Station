@@ -14,6 +14,7 @@
 #include <atomic>
 #include "gs_modbus.h"
 #include "shell.h"
+#include "can_rx.h"
 #include <ctime>
 
 #ifndef GS_RS485_RX
@@ -388,6 +389,7 @@ void setup() {
 
     g_sv.set_config(shell::load_config());
     shell::begin(esp_random());
+    canrx::begin();      // пассивный CAN-сниффер батареи (отдельная задача, RS485 не затрагивает)
     Serial.printf("gs boot: reset=%d short_boots=%u safe=%d\n", (int)esp_reset_reason(), (unsigned)rtc_short_boots, g_safe_mode);
     xTaskCreatePinnedToCore(gs_task, "gs_core", 8192, nullptr, 3, nullptr, 1);
     xTaskCreatePinnedToCore(led_task, "gs_led", 3072, nullptr, 1, nullptr, 0);
