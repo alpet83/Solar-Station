@@ -161,7 +161,7 @@ static bool authed(bool write) {
 static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 ? (int64_t)t : -1; }
 
 static void h_state() {
-    if (!authed(false)) return;
+    // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
     static char buf[2800];
     static Snapshot s;
@@ -175,7 +175,7 @@ static void h_state() {
 }
 
 static void h_config_get() {
-    if (!authed(false)) return;
+    // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
     static char buf[1400];
     gs::Config c;
@@ -241,7 +241,7 @@ static void h_cmd() {
 
 // GET /api/sniff — ритм логгера и последние кадры шины (готовый JSON от задачи шины).
 static void h_sniff() {
-    if (!authed(false)) return;
+    // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
     if (!g_sniff_prov) { g_http.send(404, "text/plain", "no sniffer"); return; }
     const size_t cap = 9000;
@@ -283,7 +283,7 @@ static void h_mode() {
 // GET /api/regs?addr=25201&count=79 — сырые регистры из кэша (без обращения к шине). 404, если
 // диапазон не опрашивается; age_ms в ответе — возраст блока, свежесть проверяет потребитель.
 static void h_regs() {
-    if (!authed(false)) return;
+    // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
     long addr = g_http.arg("addr").toInt(), cnt = g_http.arg("count").toInt();
     if (addr < 0 || addr > 65535 || cnt < 1 || cnt > gs::kMaxBlockRegs) { g_http.send(400, "text/plain", "bad range"); return; }
@@ -306,7 +306,7 @@ static const char kIndex[] PROGMEM =
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
     "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/update>OTA</a></p>";
 
-static void h_index() { if (authed(false)) g_http.send_P(200, "text/html", kIndex); }
+static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
 static const char kUpdForm[] PROGMEM =
     "<!doctype html><meta charset=utf-8><title>OTA</title><h3>OTA</h3>"

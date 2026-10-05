@@ -1,6 +1,7 @@
 #include "gs_bus.h"
 
 #include <cmath>
+#include <cstring>
 
 #include "gs_modbus.h"
 
@@ -52,6 +53,7 @@ bool BusSniffer::close(uint64_t now_ms) {
     if (r.kind == FrameKind::Junk) ++junk_;
     ring_[n_ % kRing] = r; ++n_;
     last_ = r;
+    memcpy(last_buf_, buf_, len_);
     len_ = 0;
     return true;
 }
@@ -78,6 +80,32 @@ bool BusSniffer::recent(size_t i, FrameRec& out) const {
     if (i >= count()) return false;
     out = ring_[(n_ - 1 - i) % kRing];
     return true;
+}
+
+// ---- PassiveTelemetry ------------------------------------------------------------------------
+
+void PassiveTelemetry::on_frame(const FrameRec& f, const uint8_t* d, uint64_t now) {
+    if (!f.crc_ok || f.id != id_) return;
+    if (f.kind == FrameKind::Request && f.fn == 0x03) {
+        have_req_ = true; req_addr_ = f.addr; req_cnt_ = f.count; req_ms_ = now;
+        return;
+    }
+    if (f.kind != FrameKind::Response || f.fn != 0x03 || !have_req_) return;
+    have_req_ = false;
+    if (f.count != req_cnt_ || now < req_ms_ || now - req_ms_ > kPairMs || f.count > kMaxBlockRegs) return;
+    uint16_t r[kMaxBlockRegs];
+    for (uint16_t i = 0; i < f.count; ++i) r[i] = (uint16_t)((d[3 + 2 * i] << 8) | d[4 + 2 * i]);
+    if (req_addr_ == kBlockRtAddr && f.count >= 38)       { rt_ = Telemetry();  decode_rt(r, rt_);   rt_ms_ = now; }
+    else if (req_addr_ == kBlockChgAddr && f.count >= 7)  { chg_ = Telemetry(); decode_chg(r, chg_); chg_ms_ = now; }
+    else if (req_addr_ == kBlockCfgAddr && f.count >= 5)  { cfg_ = Telemetry(); decode_cfg(r, cfg_); cfg_ms_ = now; }
+}
+
+Telemetry PassiveTelemetry::get(uint64_t now) const {
+    Telemetry t;
+    if (rt_.rt_ok && now >= rt_ms_ && now - rt_ms_ <= kFreshMs) { t.pack_v = rt_.pack_v; t.grid_v = rt_.grid_v; t.load_w = rt_.load_w; t.relay_grid = rt_.relay_grid; t.rt_ok = true; }
+    if (chg_.chg_ok && now >= chg_ms_ && now - chg_ms_ <= kFreshMs) { t.pack_v_alt = chg_.pack_v_alt; t.chg_curr_a = chg_.chg_curr_a; t.chg_ok = true; }
+    if (cfg_.cfg_ok && now >= cfg_ms_ && now - cfg_ms_ <= kFreshMs) { t.ongrid_reg = cfg_.ongrid_reg; t.cfg_ok = true; }
+    return t;
 }
 
 // ---- LoggerTracker ---------------------------------------------------------------------------

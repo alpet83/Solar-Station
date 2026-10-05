@@ -58,6 +58,7 @@ static gs::RegCache g_cache;
 // Пассивный разбор шины и трекер ритма логгера: используются только из задачи ядра.
 static gs::BusSniffer g_sn(6);
 static gs::LoggerTracker g_trk;
+static gs::PassiveTelemetry g_pas(4);   // напряжения из чужого опроса (режим приёма)
 static const uint32_t kPollPeriodActiveMs = 3000;   // между пачками логгера опрашиваем чаще
 static const uint32_t kPollNeedMs = 3500;           // сколько тишины нужно для одного цикла опроса
 static std::atomic<uint8_t> g_inv_state{(uint8_t)gs::InvState::NoLink};   // для светодиода
@@ -97,6 +98,7 @@ static void bus_in(const uint8_t* p, size_t n) {
     if (n && g_sn.feed(p, n, now)) {
         const gs::FrameRec& f = g_sn.last();
         g_trk.observe(f, now - (uint32_t)((uint32_t)now - f.t_ms));
+        g_pas.on_frame(f, g_sn.last_bytes(), now);
     }
 }
 static void bus_tick() {
@@ -104,6 +106,7 @@ static void bus_tick() {
     if (g_sn.poll(now)) {
         const gs::FrameRec& f = g_sn.last();
         g_trk.observe(f, now - (uint32_t)((uint32_t)now - f.t_ms));
+        g_pas.on_frame(f, g_sn.last_bytes(), now);
     }
     g_trk.tick(now);
 }
@@ -282,7 +285,7 @@ static void gs_task(void*) {
         // safe-mode после аварийных перезагрузок отменяет режим приёма: защиты (возврат в сеть) важнее
         const bool sniff_only = shell::sniff_only() && !g_safe_mode;
         if (sniff_only || shell::ota_active()) {
-            g_tel = gs::Telemetry();                       // на шину не передаём
+            g_tel = g_pas.get(now_ms);                      // на шину не передаём; значения — из чужого опроса
         } else {
             const gs::Gate gate = g_trk.may_transmit(now_ms, kPollNeedMs);
             poll_inverter(gate.ok);

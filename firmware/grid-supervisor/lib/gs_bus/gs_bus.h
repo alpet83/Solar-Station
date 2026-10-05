@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "gs_modbus.h"
+
 namespace gs {
 
 enum class FrameKind : uint8_t { Junk = 0, Request, Response, Exception, WriteEcho };
@@ -44,6 +46,8 @@ public:
     size_t count() const { return n_ < kRing ? n_ : kRing; }
     uint32_t total() const { return n_; }
     uint32_t junk() const { return junk_; }
+    // Байты последнего закрытого кадра (копия: буфер приёма уже может быть перезаписан).
+    const uint8_t* last_bytes() const { return last_buf_; }
 
 private:
     bool close(uint64_t now_ms);
@@ -54,6 +58,26 @@ private:
     FrameRec ring_[kRing];
     uint32_t n_ = 0, junk_ = 0;
     FrameRec last_;
+    uint8_t last_buf_[kBuf];
+};
+
+// Пассивный разбор чужого опроса: пары «запрос чтения → ответ» с адресом id превращаются в
+// телеметрию без единой передачи в шину. Нужен в режиме приёма, чтобы видеть напряжения.
+class PassiveTelemetry {
+public:
+    static constexpr uint32_t kPairMs = 1500;   // ответ должен прийти не позже, чем через столько после запроса
+    static constexpr uint32_t kFreshMs = 30000; // старше — считаем данные устаревшими
+    explicit PassiveTelemetry(uint8_t id = 4) : id_(id) {}
+    void set_id(uint8_t id) { id_ = id; }
+    // f/data — только что закрытый кадр (BusSniffer::last()/last_bytes()).
+    void on_frame(const FrameRec& f, const uint8_t* data, uint64_t now_ms);
+    // Телеметрия только из свежих блоков; устаревшие поля остаются NaN/-1.
+    Telemetry get(uint64_t now_ms) const;
+private:
+    uint8_t id_;
+    bool have_req_ = false; uint16_t req_addr_ = 0, req_cnt_ = 0; uint64_t req_ms_ = 0;
+    Telemetry rt_, chg_, cfg_;                  // каждый блок декодируется в свою копию
+    uint64_t rt_ms_ = 0, chg_ms_ = 0, cfg_ms_ = 0;
 };
 
 // Разбор одного буфера как кадра (экспортируется для тестов).

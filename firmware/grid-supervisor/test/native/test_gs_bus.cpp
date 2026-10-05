@@ -1,5 +1,6 @@
 #include "gs_bus.h"
 #include "gs_modbus.h"
+#include <cmath>
 #include <cstdio>
 #include <vector>
 using namespace gs;
@@ -162,8 +163,43 @@ static void test_period_90() {   // реальные интервалы из з�
     CHECK(tr.period_ms() > 85000 && tr.period_ms() < 95000);
 }
 
+// Пассивный разбор: запрос+ответ чужого мастера превращаются в напряжения; устаревшее сбрасывается.
+static std::vector<uint8_t> resp_vals(uint8_t id, uint16_t n, uint16_t idx, uint16_t val) {
+    std::vector<uint8_t> f{id, 3, (uint8_t)(n * 2)};
+    for (uint16_t i = 0; i < n; ++i) { uint16_t v = i == idx ? val : 0; f.push_back(v >> 8); f.push_back(v & 255); }
+    uint16_t c = crc16(f.data(), f.size()); f.push_back(c & 255); f.push_back(c >> 8); return f;
+}
+static void test_passive() {
+    PassiveTelemetry p(4);
+    BusSniffer s(6);
+    auto feed = [&](const std::vector<uint8_t>& b, uint64_t t) {
+        s.feed(b.data(), b.size(), t); s.poll(t + 10);
+        p.on_frame(s.last(), s.last_bytes(), t + 10);
+    };
+    feed(req(4, 3, 25201, 79), 1000);
+    feed(resp_vals(4, 79, 4, 528), 1030);                    // 25205 = 52.8 В
+    Telemetry t = p.get(1100);
+    CHECK(t.rt_ok && std::fabs(t.pack_v - 52.8f) < 0.01f);
+    feed(req(4, 3, 15201, 22), 1200);
+    feed(resp_vals(4, 22, 5, 531), 1230);                    // 15206 = 53.1 В
+    t = p.get(1300);
+    CHECK(t.chg_ok && std::fabs(t.pack_v_alt - 53.1f) < 0.01f && t.rt_ok);
+    feed(resp_vals(4, 79, 4, 999), 5000);                    // ответ без запроса — игнор
+    CHECK(std::fabs(p.get(5100).pack_v - 52.8f) < 0.01f);
+    feed(req(5, 3, 25201, 79), 6000); feed(resp_vals(5, 79, 4, 111), 6030);   // чужой id
+    CHECK(std::fabs(p.get(6100).pack_v - 52.8f) < 0.01f);
+    feed(req(4, 3, 25201, 79), 7000); feed(resp_vals(4, 78, 4, 111), 7030);   // длина не совпала с запросом
+    CHECK(std::fabs(p.get(7100).pack_v - 52.8f) < 0.01f);
+    feed(req(4, 3, 25201, 74), 8000); feed(resp_vals(4, 74, 4, 520), 8030);   // блок логгера (74) тоже годится
+    CHECK(std::fabs(p.get(8100).pack_v - 52.0f) < 0.01f);
+    feed(req(4, 3, 25201, 79), 9000); feed(resp_vals(4, 79, 4, 530), 11000);  // ответ слишком поздно (>1,5 с)
+    CHECK(std::fabs(p.get(11100).pack_v - 52.0f) < 0.01f);
+    t = p.get(8040 + PassiveTelemetry::kFreshMs + 1);
+    CHECK(!t.rt_ok && !std::isfinite(t.pack_v) && !t.chg_ok);   // всё устарело
+}
+
 int main() {
-    test_classify(); test_sniffer(); test_tracker(); test_tracker_misc(); test_endless_and_reref(); test_set_period(); test_period_90();
+    test_classify(); test_sniffer(); test_tracker(); test_tracker_misc(); test_endless_and_reref(); test_set_period(); test_period_90(); test_passive();
     printf("bus: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
