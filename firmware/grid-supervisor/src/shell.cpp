@@ -1,7 +1,10 @@
 #include "shell.h"
 #include "gs_cli.h"
+#include <memory>
+#include <new>
 #include "can_rx.h"
 #include "notify.h"
+#include "stats.h"
 
 #include <Preferences.h>
 #include <Update.h>
@@ -266,14 +269,25 @@ static void h_can() {
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
 }
 
+// GET /api/pvstats — статистика включений PV (сутки, события реле PV), чтение открыто.
+static void h_pvstats() {
+    touch_api();
+    constexpr size_t kCap = 6000;     // худший случай ~5100 байт (8 суток + 32 события); в куче на время запроса — не занимает статическое ОЗУ
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[kCap]);
+    size_t n = buf ? stats::json(buf.get(), kCap) : 0;
+    g_http.sendHeader("Cache-Control", "no-store");
+    g_http.send(n ? 200 : 503, "application/json", n ? buf.get() : "{}");
+}
+
 // GET /api/bms_events — журнал последних 16 событий BMS (изменения «знаковых» полей, ячейки, пропажа кадров), от новых к старым.
 static void h_bms_events() {
     // чтение открыто без пароля (в API нет секретов), как /api/state
     touch_api();
-    static char buf[4096];     // 16 событий × <= ~220 байт
-    size_t n = canrx::events_json(buf, sizeof buf);
+    constexpr size_t kCap = 4096;     // 16 событий × <= ~220 байт; в куче на время запроса
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[kCap]);
+    size_t n = buf ? canrx::events_json(buf.get(), kCap) : 0;
     g_http.sendHeader("Cache-Control", "no-store");
-    g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
+    g_http.send(n ? 200 : 503, "application/json", n ? buf.get() : "{}");
 }
 
 // POST /api/can  [speed=0|100|125|250|500] [ack=0|1] [hb=0|1] — скорость CAN-сниффера, кбит/с (0 = выключить) и подтверждение кадров (ACK); сохраняется в NVS.
@@ -373,7 +387,7 @@ static const char kIndex[] PROGMEM =
     "<h3>grid-supervisor</h3><pre id=s>loading…</pre>"
     "<script>async function t(){try{const r=await fetch('/api/state');const j=await r.json();"
     "document.getElementById('s').textContent=JSON.stringify(j,null,1)}catch(e){}}t();setInterval(t,5000)</script>"
-    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
+    "<p><a href=/api/config>config</a> · <a href=/api/sniff>sniff</a> · <a href=/api/can>can</a> · <a href=/api/bms_events>bms_events</a> · <a href=/api/pvstats>pvstats</a> · <a href=/api/webhook>webhook</a> · <a href=/update>OTA</a></p>";
 
 static void h_index() { g_http.send_P(200, "text/html", kIndex); }
 
@@ -865,6 +879,7 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/can", HTTP_GET, h_can);
     g_http.on("/api/can", HTTP_POST, h_can_set);
     g_http.on("/api/bms_events", HTTP_GET, h_bms_events);
+    g_http.on("/api/pvstats", HTTP_GET, h_pvstats);
     g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/api/logger", HTTP_POST, h_logger);
     g_http.on("/api/webhook", HTTP_GET, h_webhook_get);

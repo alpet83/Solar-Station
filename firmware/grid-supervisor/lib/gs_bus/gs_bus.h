@@ -73,7 +73,9 @@ public:
     void on_frame(const FrameRec& f, const uint8_t* data, uint64_t now_ms);
     // Телеметрия только из свежих блоков; устаревшие поля остаются NaN/-1.
     Telemetry get(uint64_t now_ms) const;
+    uint32_t chg_updates() const { return chg_n_; }   // счётчик разобранных блоков 15201 (чтобы не учитывать один и тот же дважды)
 private:
+    uint32_t chg_n_ = 0;
     uint8_t id_;
     bool have_req_ = false; uint16_t req_addr_ = 0, req_cnt_ = 0; uint64_t req_ms_ = 0;
     Telemetry rt_, chg_, cfg_;                  // каждый блок декодируется в свою копию

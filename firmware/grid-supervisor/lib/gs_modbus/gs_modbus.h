@@ -66,6 +66,10 @@ struct Telemetry {
     int8_t relay_grid = -1;    // 25238
     float pack_v_alt = kNaN;   // 15206, x0.1
     float chg_curr_a = kNaN;   // 15207, x0.1
+    float pv_v = kNaN;         // 15205, x0.1 (PV_volt)
+    float chg_w = kNaN;        // 15208 (chg_power)
+    int8_t pv_relay = -1;      // 15212 (PV_relay): -1 неизвестно
+    int16_t chg_state = -1;    // 15203 (charging_state), -1 неизвестно
     int8_t ongrid_reg = -1;    // 20105
 };
 

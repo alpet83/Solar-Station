@@ -18,6 +18,7 @@
 #include "gs_trig.h"
 #include "gs_notify.h"
 #include "notify.h"
+#include "stats.h"
 #include <ctime>
 
 #ifndef GS_REV
@@ -338,6 +339,13 @@ static void gs_task(void*) {
         float ext_a = gs::kNaN; uint64_t ext_age = 0;
         float a; uint64_t age;
         if (shell::ext_charge(a, age)) { ext_a = a; ext_age = age; }
+        {   // статистика PV: один раз на каждый свежий блок 15201 (в режиме приёма — по счётчику разобранных блоков)
+            static uint32_t last_chg_n = 0;
+            const uint32_t cn = g_pas.chg_updates();
+            const bool fresh = (sniff_only || shell::ota_active()) ? (g_tel.chg_ok && cn != last_chg_n) : g_tel.chg_ok;
+            last_chg_n = cn;
+            if (fresh) stats::feed(g_tel, (uint32_t)now_ms, epoch_now(), g_tel.pack_v);
+        }
         gs::Input in = gs::make_input(g_tel, now_ms, g_safe_mode, ext_a, ext_age);
         {   // самая слабая ячейка из CAN (NaN — нет свежих данных); берём и в режиме приёма, чтобы показывать в /api/state
             float cv = gs::kNaN; bool seen = cells_seen;
@@ -445,6 +453,7 @@ void setup() {
 
     g_sv.set_config(shell::load_config());
     shell::begin(esp_random());
+    stats::begin();      // статистика включений PV (ОЗУ)
     notify::begin();     // вебхук-уведомления: настройки из NVS + задача отправки (низкий приоритет)
     {
         char rs[40]; snprintf(rs, sizeof rs, "%s%s", reset_reason_name(esp_reset_reason()), g_safe_mode ? ",safe" : "");

@@ -90,6 +90,10 @@ void decode_rt(const uint16_t* r, Telemetry& t) {
 void decode_chg(const uint16_t* r, Telemetry& t) {
     t.pack_v_alt = r[5] * 0.1f;
     t.chg_curr_a = r[6] * 0.1f;
+    t.pv_v = r[4] * 0.1f;
+    t.chg_w = (float)r[7];
+    t.pv_relay = (r[11] == 1) ? 1 : (r[11] == 0 ? 0 : -1);
+    t.chg_state = (int16_t)r[2];
     t.chg_ok = true;
 }
 
