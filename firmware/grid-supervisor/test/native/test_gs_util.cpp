@@ -64,7 +64,7 @@ int main() {
         sv.events = ev; sv.n_events = kEventCap; sv.epoch_s = 1790826665;
         static char big[3000];
         size_t k = state_to_json(sv, big, sizeof big);
-        CHECK(k > 0 && strstr(big, "\"battery\":{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null},\"events\":["));
+        CHECK(k > 0 && strstr(big, "\"battery\":{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null,\"i_abs\":null,\"protocol\":null},\"events\":["));
         PylonBattery pb; CanFrame f; f.t_ms = 1000;
         f.id = 0x356; f.dlc = 6; f.data[0] = 0x72; f.data[1] = 0x14; f.data[2] = 0xE0; f.data[3] = 0xFF; pb.feed(f);
         f.id = 0x355; f.dlc = 4; f.data[0] = 87; f.data[1] = 0; pb.feed(f);
@@ -73,10 +73,20 @@ int main() {
         BatteryBrief bb = battery_brief(pb, 3500);
         sv.bat = &bb;
         k = state_to_json(sv, big, sizeof big);
-        CHECK(k > 0 && big[k - 1] == '}' && strlen(big) == k && strstr(big, "\"battery\":{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":false,\"alarm\":false,\"age_s\":2}"));
+        CHECK(k > 0 && big[k - 1] == '}' && strlen(big) == k && strstr(big, "\"battery\":{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":false,\"alarm\":false,\"age_s\":2,\"i_abs\":null,\"protocol\":\"pylon\"}"));
         printf("state json with 8 events + battery: %zu bytes (shell buffer 3072)\n", k);
         CHECK(k < 3072 - 400);
         CHECK(state_to_json(sv, big, k) == 0 && state_to_json(sv, big, k + 1) == k);   // граница буфера
+        // Seplos 100k: i = null (знак неизвестен), i_abs, protocol
+        SeplosBattery sb; CanFrame g; g.ext = true; g.dlc = 8; g.t_ms = 1000;
+        g.id = 0x00030400; const uint8_t d4[8] = {0x1B, 0x02, 0x6F, 0x00, 0x1D, 0x00, 0, 0}; memcpy(g.data, d4, 8); sb.feed(g);
+        g.id = 0x00030500; const uint8_t d5[8] = {0x46, 0x00, 0x60, 0x00, 0xC1, 0x02, 0, 0}; memcpy(g.data, d5, 8); sb.feed(g);
+        g.id = 0x00030200; memset(g.data, 0, 8); sb.feed(g);
+        PylonBattery none;
+        bb = battery_brief(none, sb, 3500); sv.bat = &bb;
+        k = state_to_json(sv, big, sizeof big);
+        CHECK(k > 0 && strstr(big, "\"battery\":{\"v\":53.90,\"i\":null,\"soc\":70,\"charge_en\":null,\"discharge_en\":null,\"alarm\":false,\"age_s\":2,\"i_abs\":11.1,\"protocol\":\"seplos_100k\"},\"events\":["));
+        CHECK(k < 3072 - 400);
         sv.bat = nullptr; sv.n_events = 0; sv.events = nullptr;
     }
 

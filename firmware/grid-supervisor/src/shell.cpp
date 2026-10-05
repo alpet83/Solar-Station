@@ -164,7 +164,7 @@ static int64_t epoch_or_neg() { time_t t = time(nullptr); return t > 1700000000 
 static void h_state() {
     // чтение открыто без пароля (в API нет секретов); пишущие запросы и OTA по-прежнему под паролем
     touch_api();
-    static char buf[3072];     // худший случай (8 событий + батарея) ~1.7 КБ
+    static char buf[3072];     // худший случай (8 событий + батарея) ~1.8 КБ
     static Snapshot s;
     if (!xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100))) { g_http.send(503, "text/plain", "busy"); return; }
     s = g_snap; xSemaphoreGive(g_mtx);

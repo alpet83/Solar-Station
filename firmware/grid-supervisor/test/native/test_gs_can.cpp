@@ -216,12 +216,109 @@ static void test_json() {
     // то же для краткой сводки
     char bj[200]; BatteryBrief br = battery_brief(b, 1500);
     size_t m = battery_brief_json(br, bj, sizeof bj);
-    CHECK(m > 0 && !strcmp(bj, "{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":true,\"alarm\":true,\"age_s\":0}"));
+    CHECK(m > 0 && !strcmp(bj, "{\"v\":52.34,\"i\":-3.2,\"soc\":87,\"charge_en\":true,\"discharge_en\":true,\"alarm\":true,\"age_s\":0,\"i_abs\":null,\"protocol\":\"pylon\"}"));
     bool all1 = true;
     for (size_t cap = 0; cap <= m; ++cap) if (battery_brief_json(br, bj, cap) != 0) all1 = false;
     CHECK(all1);
     CHECK(battery_brief_json(BatteryBrief(), bj, sizeof bj) > 0 &&
-          !strcmp(bj, "{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null}"));
+          !strcmp(bj, "{\"v\":null,\"i\":null,\"soc\":null,\"charge_en\":null,\"discharge_en\":null,\"alarm\":null,\"age_s\":null,\"i_abs\":null,\"protocol\":null}"));
+}
+
+// ---- Seplos 100 кбит/с (29-битные ID, гипотезы по наблюдаемым кадрам) --------------------------------
+static const CanFrame s100 = fr(0x00030100, 5000, {0x40, 0x02, 0x08, 0x07, 0xD0, 0x01, 0x08, 0x07}, true);
+static const CanFrame s200 = fr(0x00030200, 5000, {0, 0, 0, 0, 0, 0, 0, 0}, true);
+static const CanFrame s400 = fr(0x00030400, 5000, {0x1B, 0x02, 0x6F, 0x00, 0x1D, 0x00, 0x00, 0x00}, true);
+static const CanFrame s500 = fr(0x00030500, 5000, {0x46, 0x00, 0x60, 0x00, 0xC1, 0x02, 0x00, 0x00}, true);
+
+static void test_seplos() {
+    SeplosBattery b;
+    CHECK(b.feed(s100) && b.feed(s200) && b.feed(s400) && b.feed(s500));
+    CHECK(near(b.limits.charge_v, 57.6f) && near(b.limits.charge_a, 180.0f) && near(b.limits.discharge_v_min, 46.4f) && near(b.limits.discharge_a, 180.0f));
+    CHECK(near(b.pack.v, 53.9f) && near(b.pack.i_abs, 11.1f) && near(b.pack.temp_c, 29.0f));
+    CHECK(b.soc.soc == 70 && b.soc.soh == 96 && b.soc.soc10 == 705);
+    CHECK(b.prot.have && !b.prot.alarm && b.last_ms() == 5000 && b.any());
+
+    // аварии: любой ненулевой байт 0x…0200
+    CHECK(b.feed(fr(0x00030200, 6000, {0, 0, 0, 0, 0, 0, 0, 0x04}, true)) && b.prot.alarm && b.prot.raw[7] == 4 && b.prot.t_ms == 6000);
+    // чужие/короткие/стандартные кадры не разбираются
+    SeplosBattery e;
+    CHECK(!e.feed(fr(0x00030300, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true)));      // неизвестный ID семейства
+    CHECK(!e.feed(fr(0x00040400, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true)));
+    CHECK(!e.feed(fr(0x00030401, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true)));
+    CHECK(!e.feed(fr(0x00030400, 1, {1, 2, 3, 4, 5}, true)));               // короткий
+    CHECK(!e.feed(fr(0x00030100, 1, {1, 2, 3, 4, 5, 6, 7}, true)));
+    CHECK(!e.feed(fr(0x00030400, 1, {0x1B, 0x02, 0x6F, 0x00, 0x1D, 0x00, 0, 0}, false)));   // не расширенный
+    CHECK(!e.feed(fr(0x351, 1, {0x14, 0x02, 0xF4, 0x01, 0xB0, 0x04, 0xB8, 0x01})) && !e.any());
+    // и Pylon не принимает кадры Seplos
+    PylonBattery p; CHECK(!p.feed(s400) && !p.pack.have);
+
+    // brief: v, soc, alarm; i = NaN, i_abs; charge_en/discharge_en неизвестны
+    PylonBattery none;
+    BatteryBrief r = battery_brief(none, b, 7000);
+    CHECK(near(r.v, 53.9f) && near(r.soc, 70) && std::isnan(r.i) && near(r.i_abs, 11.1f) && r.charge_en < 0 && r.discharge_en < 0 && r.alarm == 1 && r.age_s == 1);
+    CHECK(r.protocol && !strcmp(r.protocol, "seplos_100k"));
+    char bj[220];
+    CHECK(battery_brief_json(r, bj, sizeof bj) > 0 && json_ok(bj) &&
+          !strcmp(bj, "{\"v\":53.90,\"i\":null,\"soc\":70,\"charge_en\":null,\"discharge_en\":null,\"alarm\":true,\"age_s\":1,\"i_abs\":11.1,\"protocol\":\"seplos_100k\"}"));
+    // stale после 10 с (кадры 0x200 — 6000, остальные 5000)
+    r = battery_brief(none, b, 5000 + 10000);
+    CHECK(near(r.v, 53.9f) && r.alarm == 1);
+    r = battery_brief(none, b, 5000 + 10001);
+    CHECK(std::isnan(r.v) && std::isnan(r.soc) && std::isnan(r.i_abs) && r.alarm == 1 && r.age_s == 9);
+    r = battery_brief(none, b, 6000 + 10001);
+    CHECK(r.alarm < 0 && r.age_s == 10 && r.protocol);
+
+    // /api/can
+    CanStats st; for (const CanFrame* f : {&s100, &s200, &s400, &s500}) st.on_frame(*f);
+    CanDriverInfo d; d.enabled = true; d.speed_kbps = 100; d.ack = true; d.state = "running";
+    static char js[kCanJsonMax];
+    size_t n = can_to_json(d, st, none, b, 7000, js, sizeof js);
+    CHECK(n > 0 && json_ok(js));
+    CHECK(strstr(js, "\"protocol\":\"seplos_100k\",\"confidence\":\"guess\",\"charge_v_max\":57.6,\"charge_a_max\":180.0,\"discharge_a_max\":180.0,\"discharge_v_min\":46.4,"));
+    CHECK(strstr(js, "\"soc\":70,\"soh\":96,\"soc10\":705,\"v\":53.90,\"i\":null,\"i_abs\":11.1,\"temp_c\":29,"));
+    CHECK(strstr(js, "\"charge_en\":null,\"discharge_en\":null") && strstr(js, "\"alarm\":true") && strstr(js, "\"prot_raw\":\"00 00 00 00 00 00 00 04\""));
+    CHECK(strstr(js, "\"id\":\"0x00030400\",\"ext\":true"));
+    printf("seplos /api/can json: %zu bytes (kCanJsonMax %zu)\n", n, (size_t)kCanJsonMax);
+    // stale: значения null, alarm null
+    n = can_to_json(d, st, none, b, 20000, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && strstr(js, "\"v\":null,\"i\":null,\"i_abs\":null") && strstr(js, "\"alarm\":null") && strstr(js, "\"prot_raw\":null") && strstr(js, "\"pack\":true"));
+    // граница буфера
+    bool ok = true;
+    std::string tmp(n + 2, 'x'); tmp[n + 1] = '#';
+    ok = can_to_json(d, st, none, b, 20000, &tmp[0], n) == 0 && can_to_json(d, st, none, b, 20000, &tmp[0], n + 1) == n && tmp[n + 1] == '#';
+    CHECK(ok);
+    // Pylon-блок несёт protocol "pylon" и null-поля Seplos
+    PylonBattery pb; pb.feed(k356);
+    n = can_to_json(d, st, pb, SeplosBattery(), 1500, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && strstr(js, "\"protocol\":\"pylon\",\"confidence\":null,\"soc10\":null,\"i_abs\":null"));
+    n = can_to_json(d, st, none, SeplosBattery(), 1500, js, sizeof js);
+    CHECK(n > 0 && json_ok(js) && strstr(js, "\"protocol\":null,\"confidence\":null"));
+}
+
+static void test_mixed() {
+    // смесь двух протоколов: обе ветки кормятся одними кадрами, активной считается та, чей кадр позже
+    PylonBattery p; SeplosBattery s; CanStats st;
+    const CanFrame seq[] = {k351, s100, k356, s400, fr(0x123, 1, {1}), fr(0x00031234, 1, {1, 2}, true), s500, k355, s200, fr(0x351, 1, {1, 2, 3}, true)};
+    for (const CanFrame& f : seq) { st.on_frame(f); p.feed(f); s.feed(f); }
+    CHECK(st.size() == 10 && p.limits.have && p.pack.have && s.limits.have && s.pack.have);
+    CHECK(st.find(0x00031234, true) && st.find(0x123, false));            // неизвестные ID — в таблице
+    BatteryBrief r = battery_brief(p, s, 5500);                          // Pylon-кадры t=1000, Seplos t=5000 -> Seplos
+    CHECK(r.protocol && !strcmp(r.protocol, "seplos_100k") && near(r.v, 53.9f));
+    p.feed(fr(0x356, 6000, {0x72, 0x14, 0xE0, 0xFF, 0xFD, 0x00}));       // Pylon свежее
+    r = battery_brief(p, s, 6500);
+    CHECK(r.protocol && !strcmp(r.protocol, "pylon") && near(r.v, 52.34f) && near(r.i, -3.2f));
+    static char js[kCanJsonMax];
+    CanDriverInfo d; d.enabled = true; d.speed_kbps = 500;
+    CHECK(can_to_json(d, st, p, s, 6500, js, sizeof js) > 0 && json_ok(js) && strstr(js, "\"protocol\":\"pylon\""));
+    // Pylon-кадр со стандартным ID 0x351 не уходит в Seplos и наоборот
+    SeplosBattery s2; PylonBattery p2;
+    CHECK(p2.feed(k351) && !s2.feed(k351) && s2.feed(s100) && !p2.feed(s100));
+    // худший случай размера: 24 ID + Seplos
+    CanStats full;
+    for (uint32_t i = 0; i < 24; ++i) full.on_frame(fr(0x00030000 + (i << 8) + 0x00, 1, {1, 2, 3, 4, 5, 6, 7, 8}, true));
+    size_t n = can_to_json(d, full, p, s, 6500, js, sizeof js);
+    CHECK(n > 0 && n < kCanJsonMax - 300);
+    printf("can json, 24 ids + battery: %zu bytes (kCanJsonMax %zu)\n", n, (size_t)kCanJsonMax);
 }
 
 int main() {
@@ -230,6 +327,8 @@ int main() {
     test_stale_and_brief();
     test_stats();
     test_json();
+    test_seplos();
+    test_mixed();
     printf("can: %d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;
 }

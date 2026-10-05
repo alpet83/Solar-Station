@@ -83,6 +83,40 @@ bool PylonBattery::feed(const CanFrame& f) {
     }
 }
 
+// Seplos 100k: расширенный кадр 0x000300NN. Раскладки — гипотезы (см. gs_can.h).
+bool SeplosBattery::feed(const CanFrame& f) {
+    if (!f.ext || (f.id & 0xFFFF00FFu) != kSeplosIdBase) return false;
+    const uint8_t* d = f.data;
+    switch ((f.id >> 8) & 0xFF) {
+    case 0x01:                                  // пределы: Uзаряда, Iзаряда, Uразряда мин, Iразряда (u16, 0,1)
+        if (f.dlc < 8) return false;
+        limits.charge_v = u16(d) * 0.1f; limits.charge_a = u16(d + 2) * 0.1f;
+        limits.discharge_v_min = u16(d + 4) * 0.1f; limits.discharge_a = u16(d + 6) * 0.1f;
+        limits.have = true; limits.t_ms = f.t_ms; return true;
+    case 0x02: {                                // аварии/защиты (биты неизвестны): сырые байты
+        if (f.dlc < 1) return false;
+        bool nz = false;
+        for (int i = 0; i < 8; ++i) { prot.raw[i] = i < f.dlc ? d[i] : 0; if (prot.raw[i]) nz = true; }
+        prot.alarm = nz; prot.have = true; prot.t_ms = f.t_ms; return true; }
+    case 0x04:                                  // U 0,1 В; |I| 0,1 А (знак неизвестен); температура °C (предположительно)
+        if (f.dlc < 6) return false;
+        pack.v = u16(d) * 0.1f; pack.i_abs = u16(d + 2) * 0.1f; pack.temp_c = (float)u16(d + 4);
+        pack.have = true; pack.t_ms = f.t_ms; return true;
+    case 0x05:                                  // SOC %, SOH % (вероятно), SOC 0,1 % (вероятно)
+        if (f.dlc < 6) return false;
+        soc.soc = u16(d); soc.soh = u16(d + 2); soc.soc10 = u16(d + 4);
+        soc.have = true; soc.t_ms = f.t_ms; return true;
+    default: return false;                      // остальные ID идут только в таблицу CanStats
+    }
+}
+
+uint32_t SeplosBattery::last_ms() const {
+    const struct { bool have; uint32_t t; } g[] = {{limits.have, limits.t_ms}, {prot.have, prot.t_ms}, {pack.have, pack.t_ms}, {soc.have, soc.t_ms}};
+    bool got = false; uint32_t best = 0;
+    for (auto& x : g) if (x.have && (!got || (int32_t)(x.t - best) > 0)) { best = x.t; got = true; }
+    return best;
+}
+
 // Раскладка Pylontech low-voltage CAN, кадр 0x359 (из памяти, в PDF Seplos её нет — проверить на железе).
 static const char* const kProt1[8] = {nullptr, "Cell or module over-voltage", "Cell or module under-voltage", "Cell or module over-temperature",
                                       "Cell or module under-temperature", nullptr, nullptr, "Discharge over-current"};
@@ -101,7 +135,7 @@ const char* pylon_alarm_name(int byte, int bit) {
 }
 
 // ---- сводка ----------------------------------------------------------------------------------
-BatteryBrief::BatteryBrief() : v(std::numeric_limits<float>::quiet_NaN()), i(v), soc(v), charge_en(-1), discharge_en(-1), alarm(-1), age_s(-1) {}
+BatteryBrief::BatteryBrief() : v(std::numeric_limits<float>::quiet_NaN()), i(v), soc(v), i_abs(v), protocol(nullptr), charge_en(-1), discharge_en(-1), alarm(-1), age_s(-1) {}
 
 BatteryBrief battery_brief(const PylonBattery& b, uint32_t now) {
     BatteryBrief r;
@@ -113,7 +147,33 @@ BatteryBrief battery_brief(const PylonBattery& b, uint32_t now) {
     const struct { bool have; uint32_t t; } g[] = {{b.limits.have, b.limits.t_ms}, {b.soc.have, b.soc.t_ms}, {b.pack.have, b.pack.t_ms},
                                                    {b.prot.have, b.prot.t_ms}, {b.req.have, b.req.t_ms}, {b.mfr.have, b.mfr.t_ms}};
     for (auto& x : g) if (x.have) { uint32_t a = can_age_ms(x.t, now); if (!any || a < best) best = a; any = true; }
-    if (any) r.age_s = (int32_t)(best / 1000);
+    if (any) { r.age_s = (int32_t)(best / 1000); r.protocol = "pylon"; }
+    return r;
+}
+
+// Какой декодер получил кадр позже: 1 — Seplos 100k, 0 — Pylon, -1 — кадров не было.
+static int pylon_last_ms(const PylonBattery& b, uint32_t* t) {
+    const struct { bool have; uint32_t t; } g[] = {{b.limits.have, b.limits.t_ms}, {b.soc.have, b.soc.t_ms}, {b.pack.have, b.pack.t_ms},
+                                                   {b.prot.have, b.prot.t_ms}, {b.req.have, b.req.t_ms}, {b.mfr.have, b.mfr.t_ms}};
+    bool got = false;
+    for (auto& x : g) if (x.have && (!got || (int32_t)(x.t - *t) > 0)) { *t = x.t; got = true; }
+    return got ? 0 : -1;
+}
+static int active_protocol(const PylonBattery& b, const SeplosBattery& s) {
+    uint32_t tp = 0;
+    bool hp = pylon_last_ms(b, &tp) == 0, hs = s.any();
+    if (hp && hs) return (int32_t)(s.last_ms() - tp) > 0 ? 1 : 0;
+    return hs ? 1 : hp ? 0 : -1;
+}
+
+BatteryBrief battery_brief(const PylonBattery& b, const SeplosBattery& s, uint32_t now) {
+    if (active_protocol(b, s) != 1) return battery_brief(b, now);
+    BatteryBrief r;
+    if (can_fresh(s.pack.have, s.pack.t_ms, now)) { r.v = s.pack.v; r.i_abs = s.pack.i_abs; }    // i остаётся NaN: знак неизвестен
+    if (can_fresh(s.soc.have, s.soc.t_ms, now)) r.soc = (float)s.soc.soc;
+    if (can_fresh(s.prot.have, s.prot.t_ms, now)) r.alarm = s.prot.alarm;                          // charge_en / discharge_en: -1 (кадров нет)
+    r.age_s = (int32_t)(can_age_ms(s.last_ms(), now) / 1000);
+    r.protocol = "seplos_100k";
     return r;
 }
 
@@ -164,17 +224,22 @@ void put_stale(W& w, bool have, uint32_t t, uint32_t now) { w.put("%s", have ? t
 }  // namespace
 
 size_t battery_brief_json(const BatteryBrief& b, char* out, size_t cap) {
-    char v[16], i[16], s[16];
-    numstr(v, sizeof v, b.v, "%.2f"); numstr(i, sizeof i, b.i, "%.1f"); numstr(s, sizeof s, b.soc, "%.0f");
+    char v[16], i[16], s[16], ia[16];
+    numstr(v, sizeof v, b.v, "%.2f"); numstr(i, sizeof i, b.i, "%.1f"); numstr(s, sizeof s, b.soc, "%.0f"); numstr(ia, sizeof ia, b.i_abs, "%.1f");
     char age[16]; if (b.age_s >= 0) snprintf(age, sizeof age, "%ld", (long)b.age_s); else snprintf(age, sizeof age, "null");
     W w(out, cap);
-    w.put("{\"v\":%s,\"i\":%s,\"soc\":%s,\"charge_en\":%s,\"discharge_en\":%s,\"alarm\":%s,\"age_s\":%s}",
-          v, i, s, tfn(b.charge_en), tfn(b.discharge_en), tfn(b.alarm), age);
+    w.put("{\"v\":%s,\"i\":%s,\"soc\":%s,\"charge_en\":%s,\"discharge_en\":%s,\"alarm\":%s,\"age_s\":%s,\"i_abs\":%s,\"protocol\":%s%s%s}",
+          v, i, s, tfn(b.charge_en), tfn(b.discharge_en), tfn(b.alarm), age, ia,
+          b.protocol ? "\"" : "", b.protocol ? b.protocol : "null", b.protocol ? "\"" : "");
     if (!w.ok) { if (cap) out[0] = 0; return 0; }
     return w.n;
 }
 
 size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBattery& b, uint32_t now, char* out, size_t cap) {
+    return can_to_json(d, st, b, SeplosBattery(), now, out, cap);
+}
+
+size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBattery& b, const SeplosBattery& sp, uint32_t now, char* out, size_t cap) {
     W w(out, cap);
     w.put("{\"enabled\":%s,\"speed_kbps\":%u,\"mode\":\"%s\",\"driver\":{\"state\":\"%s\",\"rx_msgs\":%lu,\"rx_missed\":%lu,"
           "\"bus_errors\":%lu,\"bus_off_count\":%lu,\"rx_err_counter\":%lu},\"frames_total\":%lu,\"ids_overflow\":%lu,\"ids\":[",
@@ -191,6 +256,41 @@ size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBatter
         w.put(",\"age_ms\":%lu,\"dlc\":%u,\"data\":\"%s\"}", (unsigned long)can_age_ms(s.last_ms, now), (unsigned)s.dlc, data);
     }
     w.put("],\"battery\":{\"stale_after_ms\":%lu", (unsigned long)kCanStaleMs);
+    if (active_protocol(b, sp) == 1) {
+        // Seplos 100k: все раскладки — гипотезы (confidence = "guess"); поля, которых в этих кадрах нет, — null
+        const bool fl = can_fresh(sp.limits.have, sp.limits.t_ms, now), fs = can_fresh(sp.soc.have, sp.soc.t_ms, now),
+                   fp = can_fresh(sp.pack.have, sp.pack.t_ms, now), fx = can_fresh(sp.prot.have, sp.prot.t_ms, now);
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        char c[10][16];
+        numstr(c[0], 16, fl ? sp.limits.charge_v : nan, "%.1f");
+        numstr(c[1], 16, fl ? sp.limits.charge_a : nan, "%.1f");
+        numstr(c[2], 16, fl ? sp.limits.discharge_a : nan, "%.1f");
+        numstr(c[3], 16, fl ? sp.limits.discharge_v_min : nan, "%.1f");
+        numstr(c[4], 16, fs ? (float)sp.soc.soc : nan, "%.0f");
+        numstr(c[5], 16, fs ? (float)sp.soc.soh : nan, "%.0f");
+        numstr(c[6], 16, fp ? sp.pack.v : nan, "%.2f");
+        numstr(c[7], 16, fp ? sp.pack.i_abs : nan, "%.1f");
+        numstr(c[8], 16, fp ? sp.pack.temp_c : nan, "%.0f");
+        if (fs) snprintf(c[9], 16, "%d", sp.soc.soc10); else snprintf(c[9], 16, "null");
+        w.put(",\"protocol\":\"seplos_100k\",\"confidence\":\"guess\",\"charge_v_max\":%s,\"charge_a_max\":%s,\"discharge_a_max\":%s,\"discharge_v_min\":%s,"
+              "\"soc\":%s,\"soh\":%s,\"soc10\":%s,\"v\":%s,\"i\":null,\"i_abs\":%s,\"temp_c\":%s,"
+              "\"charge_en\":null,\"discharge_en\":null,\"force_charge\":null,\"force_charge2\":null,\"full_charge_req\":null,\"req_raw\":null",
+              c[0], c[1], c[2], c[3], c[4], c[5], c[9], c[6], c[7], c[8]);
+        w.put(",\"alarm\":%s,\"protect\":null,\"alarms\":null,\"prot_raw\":", fx ? tf(sp.prot.alarm) : "null");
+        if (fx) { w.put("\""); for (int k = 0; k < 8; ++k) w.put("%s%02X", k ? " " : "", (unsigned)sp.prot.raw[k]); w.put("\""); } else w.put("null");
+        w.put(",\"modules\":null,\"mfr\":null,\"age_ms\":{\"limits\":"); put_age(w, sp.limits.have, sp.limits.t_ms, now);
+        w.put(",\"soc\":"); put_age(w, sp.soc.have, sp.soc.t_ms, now);
+        w.put(",\"pack\":"); put_age(w, sp.pack.have, sp.pack.t_ms, now);
+        w.put(",\"req\":null,\"prot\":"); put_age(w, sp.prot.have, sp.prot.t_ms, now);
+        w.put(",\"mfr\":null},\"stale\":{\"limits\":"); put_stale(w, sp.limits.have, sp.limits.t_ms, now);
+        w.put(",\"soc\":"); put_stale(w, sp.soc.have, sp.soc.t_ms, now);
+        w.put(",\"pack\":"); put_stale(w, sp.pack.have, sp.pack.t_ms, now);
+        w.put(",\"req\":null,\"prot\":"); put_stale(w, sp.prot.have, sp.prot.t_ms, now);
+        w.put(",\"mfr\":null},\"pn_tag\":null}}");
+        if (!w.ok) { if (cap) out[0] = 0; return 0; }
+        return w.n;
+    }
+    w.put(",\"protocol\":%s,\"confidence\":null,\"soc10\":null,\"i_abs\":null", active_protocol(b, sp) == 0 ? "\"pylon\"" : "null");
 
     const bool fl = can_fresh(b.limits.have, b.limits.t_ms, now), fs = can_fresh(b.soc.have, b.soc.t_ms, now),
                fp = can_fresh(b.pack.have, b.pack.t_ms, now), fr = can_fresh(b.req.have, b.req.t_ms, now),

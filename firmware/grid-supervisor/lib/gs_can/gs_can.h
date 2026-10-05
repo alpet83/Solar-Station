@@ -1,5 +1,8 @@
-// gs_can — пассивный разбор CAN-кадров батареи (Seplos BMS 3.0, протокол по умолчанию —
-// Pylontech-совместимый, 500 кбит/с). Только чистая логика без Arduino: тестируется нативно.
+// gs_can — пассивный разбор CAN-кадров батареи (Seplos BMS 3.0). Два декодера:
+//  - PylonBattery: Pylontech-совместимый протокол (11-битные ID 0x351…, 500 кбит/с по мануалу);
+//  - SeplosBattery: реальный протокол, наблюдаемый на проводе: 100 кбит/с, 29-битные ID 0x000301xx…0x000305xx.
+//    Его раскладка — ГИПОТЕЗА по значениям, документации нет (см. README, confidence = "guess").
+// Только чистая логика без Arduino: тестируется нативно.
 // Драйвер TWAI (listen-only) — в src/can_rx.cpp.
 #pragma once
 #include <cstddef>
@@ -60,6 +63,22 @@ struct PylonBattery {
     bool feed(const CanFrame& f);
 };
 
+// ---- наблюдаемый протокол Seplos на 100 кбит/с (29-битные ID, little-endian, ~1 Гц) ------------------
+// ВСЕ раскладки ниже — предположения по значениям на проводе, не подтверждены документацией.
+constexpr uint32_t kSeplosIdBase = 0x00030000;   // ID = 0x000300NN; NN = 0x01 / 0x02 / 0x04 / 0x05
+struct SeplosLimits { bool have = false; uint32_t t_ms = 0; float charge_v = 0, charge_a = 0, discharge_v_min = 0, discharge_a = 0; };   // 0x…0100: 4 × u16, шаг 0,1
+struct SeplosProt   { bool have = false; uint32_t t_ms = 0; uint8_t raw[8] = {0}; bool alarm = false; };        // 0x…0200: раскладка битов неизвестна; alarm = есть ненулевой байт
+struct SeplosPack   { bool have = false; uint32_t t_ms = 0; float v = 0, i_abs = 0, temp_c = 0; };            // 0x…0400: U 0,1 В; |I| 0,1 А (знак НЕ известен); temp_c — предположительно °C
+struct SeplosSoc    { bool have = false; uint32_t t_ms = 0; int soc = 0, soh = 0, soc10 = 0; };               // 0x…0500: SOC %, SOH % (вероятно), SOC в 0,1 % (вероятно)
+
+struct SeplosBattery {
+    SeplosLimits limits; SeplosProt prot; SeplosPack pack; SeplosSoc soc;
+    // true — кадр узнан и разобран; чужие/короткие/стандартные кадры игнорируются
+    bool feed(const CanFrame& f);
+    uint32_t last_ms() const;                  // время самого свежего разобранного кадра (если any())
+    bool any() const { return limits.have || prot.have || pack.have || soc.have; }
+};
+
 inline bool can_fresh(bool have, uint32_t t_ms, uint32_t now_ms) { return have && can_age_ms(t_ms, now_ms) <= kCanStaleMs; }
 
 // Имя бита (0..7) байта 0/1 Protection (prot1, prot2) или Alarm (alarm1, alarm2); nullptr — бит не определён.
@@ -69,12 +88,16 @@ const char* pylon_alarm_name(int byte, int bit);
 // Краткая сводка для /api/state; NaN / -1 — нет свежих данных.
 struct BatteryBrief {
     float v, i, soc;
+    float i_abs;                               // |I| без знака (Seplos 100k: знак неизвестен, i = NaN)
+    const char* protocol;                      // "pylon" / "seplos_100k" / nullptr — какой декодер получал кадры последним
     int8_t charge_en, discharge_en, alarm;    // -1 нет данных
     int32_t age_s;                             // возраст самого свежего кадра, с; -1 — кадров не было
     BatteryBrief();
 };
 BatteryBrief battery_brief(const PylonBattery& b, uint32_t now_ms);
-// {"v":..,"i":..,"soc":..,"charge_en":..,"discharge_en":..,"alarm":..,"age_s":..}; 0 — не влезло.
+// Для двух декодеров: берётся тот, чей кадр пришёл позже (при равенстве — Pylon).
+BatteryBrief battery_brief(const PylonBattery& b, const SeplosBattery& s, uint32_t now_ms);
+// {"v":..,"i":..,"soc":..,"charge_en":..,"discharge_en":..,"alarm":..,"age_s":..,"i_abs":..,"protocol":..}; 0 — не влезло.
 size_t battery_brief_json(const BatteryBrief& b, char* out, size_t cap);
 
 // Состояние драйвера для /api/can (заполняет src/can_rx.cpp).
@@ -85,7 +108,8 @@ struct CanDriverInfo {
     uint32_t rx_msgs = 0, rx_missed = 0, bus_errors = 0, bus_off_count = 0, rx_err_counter = 0;
 };
 // Полный JSON /api/can. 0 — не влезло в буфер. Для 24 ID с запасом хватает kCanJsonMax.
-constexpr size_t kCanJsonMax = 4800;
+constexpr size_t kCanJsonMax = 5200;
 size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBattery& b, uint32_t now_ms, char* out, size_t cap);
+size_t can_to_json(const CanDriverInfo& d, const CanStats& st, const PylonBattery& b, const SeplosBattery& s, uint32_t now_ms, char* out, size_t cap);
 
 }  // namespace gs
