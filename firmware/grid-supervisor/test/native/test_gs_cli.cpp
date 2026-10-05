@@ -107,7 +107,7 @@ static void test_can() {
     CHECK(c.kind == CliKind::Can && c.flag == 1 && c.num == 250);
     c = cli_parse("can 500", 4);
     CHECK(c.kind == CliKind::Can && c.flag == 1 && c.num == 500);
-    CHECK(is_err(cli_parse("can 125", 4)));
+    CHECK(is_err(cli_parse("can 100", 4)));
     CHECK(is_err(cli_parse("can 0500", 4)));
     CHECK(is_err(cli_parse("can on", 4)));
     CHECK(is_err(cli_parse("can 500 250", 4)));
@@ -150,7 +150,7 @@ static void test_sniff_policy() {
 int main() {
     test_simple(); test_net(); test_new(); test_can(); test_other(); test_line(); test_sniff_policy();
     CHECK(strstr(cli_help_text(), "net <1..4>") != nullptr);
-    CHECK(strstr(cli_help_text(), "can [off|250|500]") != nullptr);
+    CHECK(strstr(cli_help_text(), "can [off|125|250|500]") != nullptr);
     printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;
 }

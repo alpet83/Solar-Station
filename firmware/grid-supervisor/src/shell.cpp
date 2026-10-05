@@ -257,12 +257,21 @@ static void h_sniff() {
 
 // GET /api/can — пассивный CAN-сниффер: драйвер, таблица по ID, декодированная батарея (Pylon-кадры BMS).
 static void h_can() {
-    // чтение открыто без пароля (в API нет секретов); скорость меняется только по консоли
+    // чтение открыто без пароля (в API нет секретов); скорость меняется по консоли или POST /api/can
     touch_api();
     static char buf[gs::kCanJsonMax];
     size_t n = canrx::api_json(buf, sizeof buf);
     g_http.sendHeader("Cache-Control", "no-store");
     g_http.send(n ? 200 : 503, "application/json", n ? buf : "{}");
+}
+
+// POST /api/can  speed=0|125|250|500 — скорость CAN-сниффера, кбит/с (0 = выключить); сохраняется в NVS.
+static void h_can_set() {
+    if (!authed(true)) return;
+    String v = g_http.arg("speed");
+    if (v != "0" && v != "125" && v != "250" && v != "500") { g_http.send(400, "text/plain", "speed must be 0, 125, 250 or 500"); return; }
+    canrx::set_speed(v.toInt());
+    g_http.send(200, "text/plain", "ok");
 }
 
 // POST /api/logger  period_s=30..900 — ожидаемый период пачек даталоггера (сбрасывает захват ритма).
@@ -727,6 +736,7 @@ void begin(uint32_t boot_id) {
     g_http.on("/api/cmd", HTTP_POST, h_cmd);
     g_http.on("/api/sniff", HTTP_GET, h_sniff);
     g_http.on("/api/can", HTTP_GET, h_can);
+    g_http.on("/api/can", HTTP_POST, h_can_set);
     g_http.on("/api/mode", HTTP_POST, h_mode);
     g_http.on("/api/logger", HTTP_POST, h_logger);
     g_http.on("/setup", HTTP_ANY, h_setup);

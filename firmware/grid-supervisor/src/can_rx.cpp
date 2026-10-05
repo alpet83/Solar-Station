@@ -41,7 +41,8 @@ static bool drv_install(int kbps) {
     g.tx_queue_len = 0;                      // очередь передачи отключена: передавать нечем
     twai_timing_config_t t250 = TWAI_TIMING_CONFIG_250KBITS();
     twai_timing_config_t t500 = TWAI_TIMING_CONFIG_500KBITS();
-    twai_timing_config_t t = kbps == 250 ? t250 : t500;
+    twai_timing_config_t t125 = TWAI_TIMING_CONFIG_125KBITS();
+    twai_timing_config_t t = kbps == 125 ? t125 : kbps == 250 ? t250 : t500;
     twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
     if (twai_start() != ESP_OK) { twai_driver_uninstall(); return false; }
@@ -69,7 +70,7 @@ static void apply(int want) {
     g_info.state = !want ? "off" : g_installed ? "running" : "error";
     xSemaphoreGive(g_mtx);
     g_cur = want;
-    Serial.printf("can: %s\n", !want ? "off" : g_installed ? (want == 250 ? "listen-only 250 kbit/s" : "listen-only 500 kbit/s") : "driver install FAILED, will retry");
+    Serial.printf("can: %s\n", !want ? "off" : g_installed ? (want == 125 ? "listen-only 125 kbit/s" : want == 250 ? "listen-only 250 kbit/s" : "listen-only 500 kbit/s") : "driver install FAILED, will retry");
 }
 
 // Раз в ~0.5 с: состояние шины и счётчики; bus-off -> автоперезапуск.
@@ -127,12 +128,12 @@ void begin() {
     Preferences p; p.begin("gs", true);
     uint32_t v = p.getUInt("can", 500);
     p.end();
-    g_want.store(v == 0 || v == 250 ? (int)v : 500);
+    g_want.store(v == 0 || v == 125 || v == 250 ? (int)v : 500);
     xTaskCreatePinnedToCore(can_task, "gs_can", 4096, nullptr, 2, nullptr, 0);
 }
 
 void set_speed(int kbps) {
-    if (kbps != 0 && kbps != 250 && kbps != 500) return;
+    if (kbps != 0 && kbps != 125 && kbps != 250 && kbps != 500) return;
     Preferences p; p.begin("gs", false); p.putUInt("can", (uint32_t)kbps); p.end();
     g_want.store(kbps);
 }
