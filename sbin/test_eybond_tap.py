@@ -118,7 +118,7 @@ class DnsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_answer_rejected_and_last_ip_kept(self):
         loop = asyncio.get_running_loop()
-        tr, proto = await loop.create_datagram_endpoint(lambda: FakeDns('192.168.16.13'), local_addr=('127.0.0.1', 0))
+        tr, proto = await loop.create_datagram_endpoint(lambda: FakeDns('192.0.2.13'), local_addr=('127.0.0.1', 0))
         port = tr.get_extra_info('sockname')[1]
         up = tap.Upstream('ess.eybond.com', 502, '127.0.0.1', port)
         with self.assertRaises(OSError):                      # подмена на частный адрес = петля: отказ

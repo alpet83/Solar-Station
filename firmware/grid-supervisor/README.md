@@ -49,7 +49,7 @@ MUST PV1800 между сетью и батареей (пишется тольк
 ## Консоль по Serial (USB-C, 115200)
 
 Раз в 30 с и сразу при смене состояния печатается строка статуса сети, например
-`net: STA up ssid='Home' ip=192.168.16.77 rssi=-58 dBm net#1/2 | AP off`
+`net: STA up ssid='MyWiFi' ip=192.168.1.50 rssi=-58 dBm net#1/2 | AP off`
 (или `STA down, trying #2 '...'`, `AP on ssid=gs-setup-XXXX ip=192.168.4.1`).
 Строки вводятся прямо в терминале (`pio device monitor`, `miniterm`); пароль доступа не нужен — доверенным
 считается физический доступ к USB. Команды: `help`, `status`, `nets`, `net <1..4> <ssid> [pass]`

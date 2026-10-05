@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily PV vs sunrise/sunset report
+
+[Timer]
+OnCalendar=*-*-* 20:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy to /etc/pv-sun-report.json (not committed). Keep real hosts/coordinates ONLY in that copy.",
+  "board_url": "http://grid-supervisor.local",
+  "lat": null,
+  "lon": null,
+  "tz": "UTC",
+  "stable_s": 600,
+  "out_dir": "/var/lib/pv-sun-report",
+  "weather": true,
+  "telebot": "/etc/telebot"
+}

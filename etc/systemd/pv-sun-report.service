@@ -1,0 +1,8 @@
+[Unit]
+Description=PV vs sunrise/sunset daily report (grid-supervisor SD log)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# the board's day files are UTC; at 20:30 UTC the Cyprus solar day is over
+ExecStart=/usr/bin/python3 /opt/solar-station/sbin/pv_sun_report.py
