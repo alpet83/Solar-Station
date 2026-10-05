@@ -22,10 +22,10 @@
 #ifndef GS_RS485_TX
 #define GS_RS485_TX 22
 #endif
-#ifndef GS_RS485_DE       // управление направлением (DE и /RE вместе)
+#ifndef GS_RS485_DE       // IO17 = RE у MAX13487E (AutoDirection): LOW — приёмник включён всегда (с эхо), HIGH — приёмник отключается на время передачи
 #define GS_RS485_DE 17
 #endif
-#ifndef GS_RS485_SE       // питание/enable трансивера на T-CAN485
+#ifndef GS_RS485_SE       // IO19 = SHDN: HIGH — трансивер работает
 #define GS_RS485_SE 19
 #endif
 #ifndef GS_PIN_5V_EN
@@ -62,6 +62,7 @@ static const uint32_t kPollPeriodActiveMs = 3000;   // между пачками
 static const uint32_t kPollNeedMs = 3500;           // сколько тишины нужно для одного цикла опроса
 static std::atomic<uint8_t> g_inv_state{(uint8_t)gs::InvState::NoLink};   // для светодиода
 static std::atomic<int64_t> g_last_rt_ok_ms{-1};
+static std::atomic<uint32_t> g_uart_bytes{0}, g_uart_errs{0};   // сырые байты и ошибки UART (кадрирование, переполнение): видно, доходит ли сигнал до приёмника
 static char g_sniff_json[9000];
 static size_t g_sniff_len = 0;
 static SemaphoreHandle_t g_sniff_mtx;
@@ -91,6 +92,7 @@ static uint64_t up_ms() { return (uint64_t)(esp_timer_get_time() / 1000); }
 
 // Всё принятое с шины (кроме собственного эха) отдаём сборщику кадров; закрытый кадр — трекеру.
 static void bus_in(const uint8_t* p, size_t n) {
+    g_uart_bytes.fetch_add((uint32_t)n);
     const uint64_t now = up_ms();
     if (n && g_sn.feed(p, n, now)) {
         const gs::FrameRec& f = g_sn.last();
@@ -302,9 +304,10 @@ static void gs_task(void*) {
             events[0] = e; if (n_events < gs::kEventCap) ++n_events;
             Serial.printf("CMD %s reason=%d ok=%d\n", d.cmd == gs::Cmd::Connect ? "CONNECT" : "DISCONNECT", (int)d.reason, ok);
         }
-        if (shell::serial_log()) Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u\n",
+        if (shell::serial_log()) Serial.printf("v=%.1f/%.1f chg=%.1f load=%.0f reg=%d relay=%d flags=0x%04x rx ok/err/foreign/busy/exc=%u/%u/%u/%u/%u uart bytes=%u ferr=%u\n",
                       g_tel.pack_v, g_tel.pack_v_alt, g_tel.chg_curr_a, g_tel.load_w, g_tel.ongrid_reg, g_tel.relay_grid,
-                      (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc);
+                      (unsigned)d.flags, g_stat_ok, g_stat_err, g_stat_foreign, g_stat_busy, g_stat_exc,
+                      (unsigned)g_uart_bytes.load(), (unsigned)g_uart_errs.load());
 
         {   // состояние инвертора для светодиода: связь = блок реального времени читался за последние 45 с
             const int64_t last = g_last_rt_ok_ms.load();
@@ -367,6 +370,7 @@ void setup() {
     pinMode(GS_RS485_SE, OUTPUT);  digitalWrite(GS_RS485_SE, HIGH);
     pinMode(GS_RS485_DE, OUTPUT);  rx_mode();
     Serial1.setRxBufferSize(1024);
+    Serial1.onReceiveError([](hardwareSerial_error_t) { g_uart_errs.fetch_add(1); });
     Serial1.begin(GS_BAUD, SERIAL_8N1, GS_RS485_RX, GS_RS485_TX);
     g_sniff_mtx = xSemaphoreCreateMutex();
     // собственные запросы pv1800_ctrl.py (режим наблюдателя) — не ритм логгера
