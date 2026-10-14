@@ -36,7 +36,8 @@ DEFAULTS = {
     'services': [],
     'usb': {'enabled': True, 'window_s': 120, 'min_errors': 5, 'recovery_cmd': '/usr/sbin/usb_recovery.sh',
             'cooldown_s': 600, 'max_per_hour': 3, 'expect_devices': []},
-    'board': {'url': '', 'silent_s': 300, 'grid_min_v': 180.0, 'offgrid_alert_v': 49.0, 'offgrid_s': 120},
+    'board': {'url': '', 'silent_s': 300, 'grid_min_v': 180.0, 'offgrid_alert_v': 49.0, 'offgrid_s': 120,
+              'rt_grace_s': 120},
     'net': {'ifaces': ['eth0'], 'wifi': '', 'need_route': True},
     'feed': {'file': '', 'max_age_s': 300},
     'pi': {'temp_c': 80, 'disk_free_pct': 10},
@@ -115,6 +116,7 @@ class Monitor:
         self.recoveries = []        # epoch times
         self.board_ok_t = None
         self.board_uptime = None
+        self.rt_bad_since = None
         self.offgrid_since = None
         self.boot_id = None
         self.started = False
@@ -263,7 +265,12 @@ class Monitor:
             self.board_uptime = up
         if st.get('mode') != 'normal': problems['board:mode'] = ('alert', 'плата не в режиме normal (mode=%s): защиты не работают' % st.get('mode'))
         if st.get('safe_mode'): problems['board:safe'] = ('alert', 'плата в safe-mode')
-        if st.get('rt_ok') is not True: problems['board:rt'] = ('alert', 'плата не получает данные инвертора (rt_ok=false)')
+        if st.get('rt_ok') is True:
+            self.rt_bad_since = None
+        else:      # single failed polls are normal on the RS485 bus: alert only if there was no good reading for rt_grace_s
+            if self.rt_bad_since is None: self.rt_bad_since = now
+            if now - self.rt_bad_since >= b['rt_grace_s']:
+                problems['board:rt'] = ('alert', 'плата не получает данные инвертора уже %d мин (rt_ok=false)' % ((now - self.rt_bad_since) / 60))
         v = st.get('voltages') or {}
         grid, pack = v.get('grid'), v.get('battery')
         bad = (st.get('ongrid_reg') == 0 and isinstance(grid, (int, float)) and grid >= b['grid_min_v']

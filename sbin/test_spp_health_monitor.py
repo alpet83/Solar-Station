@@ -177,5 +177,17 @@ class T(unittest.TestCase):
         self.assertIn('feed:stale', mon.step())
 
 
+    def test_rt_ok_flaps_do_not_alert(self):
+        io = FakeIO(); mon, d = mk(io)
+        st = {'mode': 'normal', 'safe_mode': False, 'rt_ok': False, 'ongrid_reg': 1, 'uptime_ms': 10**9, 'voltages': {'grid': 240.0, 'battery': 51.0}}
+        io.board = st
+        self.assertNotIn('board:rt', mon.step())
+        io.advance(30); self.assertNotIn('board:rt', mon.step())
+        st['rt_ok'] = True; io.advance(30); mon.step()                 # a good reading resets the timer
+        st['rt_ok'] = False; io.advance(30); self.assertNotIn('board:rt', mon.step())
+        io.advance(60); self.assertNotIn('board:rt', mon.step())
+        io.advance(70); self.assertIn('board:rt', mon.step())          # >= 120 s without a good reading
+
+
 if __name__ == '__main__':
     unittest.main()
