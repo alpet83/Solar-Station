@@ -4,11 +4,15 @@ import time
 import math
 import json
 import os
-import minimalmodbus
-from pymodbus.client import ModbusSerialClient as ModbusClient
-from pymodbus.framer import ModbusRtuFramer
-# for pymodbus 3.8.0 uncomment next and remove line above
-# from pymodbus.framer import FramerRTU
+# Modbus libraries are optional: tap-only/supervisor modes need none of them, and the pymodbus API differs by version.
+try:
+    import minimalmodbus
+except ImportError:
+    minimalmodbus = None
+try:
+    from pymodbus.client import ModbusSerialClient as ModbusClient
+except ImportError:
+    ModbusClient = None
 from datetime import datetime
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -95,6 +99,16 @@ def sup_read_regs(addr, count):
     raise AssertionError(f"#FATAL: can't read registers {count}@{addr} from supervisor")
 
 
+def unit_kw(method):
+    """pymodbus >= 3.10 renamed the `slave` argument to `device_id`: use whichever this version accepts."""
+    import inspect
+    try:
+        params = inspect.signature(getattr(client, method)).parameters
+    except (TypeError, ValueError, AttributeError):
+        params = {}
+    return {'device_id': SLAVE_ID} if 'device_id' in params and 'slave' not in params else {'slave': SLAVE_ID}
+
+
 def tap_read_regs(addr, count):
     snap = gs_tapregs.load(TAP_REGS_FILE)
     if snap is None:
@@ -134,7 +148,7 @@ def read_regs(addr, count):
     if client:
         for attempt in range(5):
             log.setLevel(logging.ERROR)  # prevent spam about noise bytes from parallel client request
-            rr = client.read_holding_registers(addr, count=count, slave=SLAVE_ID)
+            rr = client.read_holding_registers(addr, count=count, **unit_kw('read_holding_registers'))
             log.setLevel(logging.NOTSET)
             if rr.isError():
                 log.warning(f" ({attempt}) read_holding_registers failed {count}@{addr}")
@@ -306,7 +320,7 @@ def process_cmd(cmd):
                 for attempt in range(10):
                     w = 'OK'
                     if client:
-                        w = client.write_register(addr, val, slave=SLAVE_ID)
+                        w = client.write_register(addr, val, **unit_kw('write_register'))
                     elif instr:
                         w = instr.write_register(addr, val)
                     registers = read_regs(addr, 1);
@@ -402,6 +416,9 @@ def read_loop():
 
 def using_pymodbus():
     global client
+    if ModbusClient is None:
+        print("#DBG: pymodbus not installed, skipping")
+        return False
     print("#DBG: Using `pymodbus`, connecting to " + DEVICE)
     # OLD pymodbus version: method='rtu', port=DEVICE, stopbits=1, bytesize=8, baudrate=BAUDRATE, timeout=2
     # handle_local_echo=True framer=ModbusRtuFramer,
@@ -426,6 +443,9 @@ def using_pymodbus():
 
 def using_mini():
     global instr
+    if minimalmodbus is None:
+        log.critical("#FATAL: neither pymodbus nor minimalmodbus is usable\n")
+        return False
     # Test connection is available
     log.debug("#DBG: trying minimalmodbus...\n")
     instr = minimalmodbus.Instrument(DEVICE, 4, debug=True)
