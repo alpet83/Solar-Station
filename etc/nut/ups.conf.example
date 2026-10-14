@@ -1,0 +1,6 @@
+# /etc/nut/ups.conf (append). dummy-ups re-reads the file written by gs_nut_feeder.py when it changes.
+[solar]
+    driver = dummy-ups
+    port = /var/lib/nut/gs-ups.dev
+    mode = dummy-once
+    desc = "Solar station (MUST PV1800 via grid-supervisor)"

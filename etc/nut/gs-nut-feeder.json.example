@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy to /etc/gs-nut-feeder.json (not committed). Real hosts only in that copy.",
+  "board_url": "http://grid-supervisor.local",
+  "out": "/var/lib/nut/gs-ups.dev",
+  "interval_s": 10,
+  "grid_min_v": 180,
+  "lb_soc": 10,
+  "chg_min_a": 0.3,
+  "rated_w": 1800,
+  "stale_alarm_s": 300
+}

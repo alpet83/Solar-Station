@@ -1,0 +1,4 @@
+# On every machine that must shut down gracefully (upsd host: 127.0.0.1 or its .local name).
+# Use a dedicated monitor user from upsd.users, NOT admin.
+MONITOR solar@<upsd-host.local> 1 <monuser> <password> secondary
+# Shut down when the UPS is on battery AND low-battery (status OB LB).
