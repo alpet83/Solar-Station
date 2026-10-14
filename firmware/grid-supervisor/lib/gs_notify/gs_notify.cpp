@@ -58,6 +58,8 @@ const char* next_placeholder(const char* p, const char*& name, size_t& len, cons
     return nullptr;
 }
 
+char g_fw_version[32] = "";
+
 void placeholder_value(const char* name, size_t len, const NotifyEvent& ev, const char* host, char* out, size_t cap) {
     out[0] = 0;
     auto is = [&](const char* n) { return strlen(n) == len && !strncmp(n, name, len); };
@@ -67,9 +69,13 @@ void placeholder_value(const char* name, size_t len, const NotifyEvent& ev, cons
     else if (is("event_tag")) notify_copy(out, cap, ev.tag);
     else if (is("event_flags")) notify_copy(out, cap, ev.flags);
     else if (is("event_time")) format_event_time(ev, out, cap);
+    else if (is("fw_version")) notify_copy(out, cap, g_fw_version);
 }
 
 }  // namespace
+
+void notify_set_fw_version(const char* v) { notify_copy(g_fw_version, sizeof g_fw_version, v ? v : ""); }
+const char* notify_fw_version() { return g_fw_version; }
 
 bool validate_template(const char* tpl, char* bad, size_t bad_cap) {
     if (bad && bad_cap) bad[0] = 0;
@@ -100,7 +106,7 @@ bool validate_url(const char* url, char* err, size_t err_cap) {
     for (const unsigned char* p = (const unsigned char*)url; *p; ++p)
         if (*p <= 0x20 || *p == 0x7f) return fail("url must not contain spaces or control characters (use %20)");
     char bad[40];
-    if (!validate_template(url, bad, sizeof bad)) return fail("unknown placeholder ${%s} (allowed: host_name, event_message, event_value, event_tag, event_flags, event_time)", bad);
+    if (!validate_template(url, bad, sizeof bad)) return fail("unknown placeholder ${%s} (allowed: host_name, event_message, event_value, event_tag, event_flags, event_time, fw_version)", bad);
     return true;
 }
 
@@ -203,7 +209,7 @@ bool webhook_set(WebhookCfg& cfg, const char* key, const char* val, char* err, s
     if (!strcmp(key, "body")) {
         if (strlen(val) > kBodyMax) return fail("body too long (max 400)");
         char bad[40];
-        if (!validate_template(val, bad, sizeof bad)) return fail("unknown placeholder ${%s} (allowed: host_name, event_message, event_value, event_tag, event_flags, event_time)", bad);
+        if (!validate_template(val, bad, sizeof bad)) return fail("unknown placeholder ${%s} (allowed: host_name, event_message, event_value, event_tag, event_flags, event_time, fw_version)", bad);
         notify_copy(cfg.body, sizeof cfg.body, val);
         return true;
     }
@@ -433,11 +439,11 @@ bool SupervisorNotifier::on_command(Cmd cmd, Reason r, bool ok, float v, uint32_
     return true;
 }
 
-NotifyEvent SupervisorNotifier::boot(const char* rev, const char* reset_reason, uint32_t uptime_ms, int64_t epoch_s) {
+NotifyEvent SupervisorNotifier::boot(const char* ver, const char* reset_reason, uint32_t uptime_ms, int64_t epoch_s) {
     NotifyEvent ev;
     ev.sev = kSevInfo;
     notify_copy(ev.tag, sizeof ev.tag, "BOOT");
-    snprintf(ev.message, sizeof ev.message, "boot rev=%s reset=%s", rev && *rev ? rev : "?", reset_reason && *reset_reason ? reset_reason : "?");
+    snprintf(ev.message, sizeof ev.message, "boot ver=%s reset=%s", ver && *ver ? ver : "?", reset_reason && *reset_reason ? reset_reason : "?");
     ev.epoch_s = epoch_s; ev.uptime_ms = uptime_ms;
     return ev;
 }

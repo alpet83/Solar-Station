@@ -1,7 +1,7 @@
 // gs_notify — уведомления на HTTP-вебхук: чистая логика без Arduino (тесты: test/native/test_gs_notify.cpp).
 //
 // Слои:
-//   * ШАБЛОНЫ: expand_template() подставляет ${host_name} ${event_message} ${event_value} ${event_tag} ${event_flags} ${event_time}
+//   * ШАБЛОНЫ: expand_template() подставляет ${host_name} ${event_message} ${event_value} ${event_tag} ${event_flags} ${event_time} ${fw_version}
 //     (имена и семантика как у встроенного вебхука прокси sbin/eybond_tap.py; значения URL-кодируются, как там).
 //     validate_template()/validate_url(): неизвестный плейсхолдер = ошибка с именем.
 //   * НАСТРОЙКИ: WebhookCfg + webhook_set() — единая валидация для консоли, /setup и POST /api/webhook.
@@ -37,8 +37,12 @@ struct NotifyEvent {
 void notify_copy(char* dst, size_t cap, const char* src);
 
 // ---- шаблоны ----------------------------------------------------------------------------------------------
-const char* const kPlaceholders[] = {"host_name", "event_message", "event_value", "event_tag", "event_flags", "event_time"};
-constexpr size_t kPlaceholderCount = 6;
+const char* const kPlaceholders[] = {"host_name", "event_message", "event_value", "event_tag", "event_flags", "event_time", "fw_version"};
+constexpr size_t kPlaceholderCount = 7;
+
+// ${fw_version}: версия прошивки "0.1v-<git rev>[x]" (задаётся при старте; до этого пусто).
+void notify_set_fw_version(const char* v);
+const char* notify_fw_version();
 
 constexpr size_t kUrlMax = 255;        // длина URL-шаблона
 constexpr size_t kBodyMax = 400;       // шаблон тела POST
@@ -167,7 +171,7 @@ public:
     // Команда CONNECT/DISCONNECT (ok — запись на шину удалась). false, если cmd == None.
     static bool on_command(Cmd cmd, Reason r, bool ok, float v, uint32_t uptime_ms, int64_t epoch_s, NotifyEvent& out);
     // Старт платы: info BOOT "boot rev=.. reset=..".
-    static NotifyEvent boot(const char* rev, const char* reset_reason, uint32_t uptime_ms, int64_t epoch_s);
+    static NotifyEvent boot(const char* ver, const char* reset_reason, uint32_t uptime_ms, int64_t epoch_s);
     void reset() { prev_ = 0; }
     uint32_t prev_flags() const { return prev_; }
 private:

@@ -26,6 +26,9 @@
 #ifndef GS_REV
 #define GS_REV "dev"
 #endif
+#ifndef GS_VERSION
+#define GS_VERSION "0.1v-" GS_REV   // версия прошивки: префикс + ревизия git (tools/git_rev.py)
+#endif
 #ifndef GS_RS485_RX
 #define GS_RS485_RX 21
 #endif
@@ -477,11 +480,12 @@ void setup() {
     shell::begin(esp_random());
     stats::begin();      // статистика включений PV (ОЗУ)
     sdlog::begin();      // запись логов на SD (если карты нет — ничего не делает, повтор раз в 5 мин)
+    gs::notify_set_fw_version(GS_VERSION);   // ${fw_version} в шаблонах вебхука
     notify::begin();     // вебхук-уведомления: настройки из NVS + задача отправки (низкий приоритет)
     {
         char rs[40]; snprintf(rs, sizeof rs, "%s%s", reset_reason_name(esp_reset_reason()), g_safe_mode ? ",safe" : "");
-        { char ev[80]; snprintf(ev, sizeof ev, "BOOT rev=%s reset=%s", GS_REV, reset_reason_name(esp_reset_reason())); sdlog::event(-1, (uint32_t)millis(), ev); }
-        notify::push(gs::SupervisorNotifier::boot(GS_REV, rs, (uint32_t)millis(), -1));   // время ещё не синхронизировано: уточнится при отправке
+        { char ev[80]; snprintf(ev, sizeof ev, "BOOT ver=%s reset=%s", GS_VERSION, reset_reason_name(esp_reset_reason())); sdlog::event(-1, (uint32_t)millis(), ev); }
+        notify::push(gs::SupervisorNotifier::boot(GS_VERSION, rs, (uint32_t)millis(), -1));   // время ещё не синхронизировано: уточнится при отправке
     }
     canrx::begin();      // пассивный CAN-сниффер батареи (отдельная задача, RS485 не затрагивает)
     canrx::set_watch_cfg(gs::make_watch_cfg(g_sv.config()));   // пороги триггеров ячеек из конфигурации

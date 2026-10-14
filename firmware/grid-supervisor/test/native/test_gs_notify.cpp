@@ -34,7 +34,7 @@ static void test_validate_template() {
     char bad[40];
     CHECK(validate_template("", bad, sizeof bad));
     CHECK(validate_template("plain text $x ${a-b} ${unclosed", bad, sizeof bad));            // как в прокси: не плейсхолдеры
-    CHECK(validate_template("${host_name}${event_message}${event_value}${event_tag}${event_flags}${event_time}", bad, sizeof bad));
+    CHECK(validate_template("${host_name}${event_message}${event_value}${event_tag}${event_flags}${event_time}${fw_version}", bad, sizeof bad));
     CHECK(!validate_template("x=${event_tag}&y=${nope}&z=${bad2}", bad, sizeof bad) && !strcmp(bad, "nope"));
     CHECK(!validate_template("${}", bad, sizeof bad) && bad[0] == 0);
     CHECK(!validate_template("${Event_Tag}", bad, sizeof bad) && !strcmp(bad, "Event_Tag"));  // регистр важен
@@ -69,6 +69,10 @@ static void test_expand() {
     ev.epoch_s = 1790000000; ev.uptime_ms = 123456;
     CHECK(exp("${host_name}", ev, "gs-1", true) == "gs-1");
     CHECK(exp("${event_tag}", ev, "h", true) == "CELL_LOW");
+    CHECK(exp("[${fw_version}]", ev, "h", true) == "[]");              // до старта версия пуста
+    notify_set_fw_version("0.1v-abc1234");
+    CHECK(exp("v=${fw_version}", ev, "h", true) == "v%3D0.1v-abc1234" || exp("v=${fw_version}", ev, "h", true) == "v=0.1v-abc1234");
+    notify_set_fw_version("");
     CHECK(exp("${event_value}", ev, "h", true) == "3040.00");
     CHECK(exp("${event_time}", ev, "h", false) == "2026-09-21 14:13:20");
     CHECK(exp("${event_time}", ev, "h", true) == "2026-09-21%2014%3A13%3A20");
@@ -371,8 +375,8 @@ static void test_commands_boot() {
     CHECK(!strcmp(e.message, "grid DISCONNECT: reason=CHARGED, bus write FAILED") && !std::isfinite(e.value));
     CHECK(!strcmp(notify_reason_name(Reason::None), "NONE"));
     e = SupervisorNotifier::boot("abc1234", "SW", 1500, -1);
-    CHECK(e.sev == kSevInfo && !strcmp(e.tag, "BOOT") && !strcmp(e.message, "boot rev=abc1234 reset=SW") && e.uptime_ms == 1500 && e.epoch_s == -1 && !std::isfinite(e.value));
-    e = SupervisorNotifier::boot("", nullptr, 0, 5); CHECK(!strcmp(e.message, "boot rev=? reset=?"));
+    CHECK(e.sev == kSevInfo && !strcmp(e.tag, "BOOT") && !strcmp(e.message, "boot ver=abc1234 reset=SW") && e.uptime_ms == 1500 && e.epoch_s == -1 && !std::isfinite(e.value));
+    e = SupervisorNotifier::boot("", nullptr, 0, 5); CHECK(!strcmp(e.message, "boot ver=? reset=?"));
     e = SupervisorNotifier::boot(std::string(200, 'r').c_str(), "PANIC", 0, 5); CHECK(strlen(e.message) == 95);
     // событие BOOT проходит фильтр только при min=info
     NotifyQueue q; CHECK(!q.push(SupervisorNotifier::boot("r", "POWERON", 0, -1), 0));
