@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to /etc/spp-health-monitor.json (not committed). Real hosts only in that copy.",
+  "interval_s": 30,
+  "state_dir": "/var/lib/spp-health",
+  "telebot": "/etc/telebot",
+  "services": ["eybond-tap", "nut-server", "gs-nut-feeder"],
+  "usb": {
+    "window_s": 120, "min_errors": 5,
+    "recovery_cmd": "/usr/sbin/usb_recovery.sh",
+    "cooldown_s": 600, "max_per_hour": 3,
+    "expect_devices": []
+  },
+  "board": {"url": "http://grid-supervisor.local", "silent_s": 300, "offgrid_alert_v": 49.0, "offgrid_s": 120},
+  "net": {"ifaces": ["eth0"]},
+  "pi": {"temp_c": 80, "disk_free_pct": 10}
+}

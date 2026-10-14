@@ -1,0 +1,13 @@
+[Unit]
+Description=SPP health monitor (USB/services/board/network watchdog with incident journal)
+After=network-online.target
+
+[Service]
+# needs root: dmesg, usb_recovery.sh, writes /var/lib/spp-health
+ExecStart=/usr/bin/python3 /opt/solar-station/sbin/spp_health_monitor.py
+Restart=always
+RestartSec=10
+StateDirectory=spp-health
+
+[Install]
+WantedBy=multi-user.target
