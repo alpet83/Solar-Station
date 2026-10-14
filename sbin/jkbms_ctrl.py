@@ -9,6 +9,7 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
+pwd_noted = False
 
 def crcJK232(byteData):
     """
@@ -224,8 +225,11 @@ def decode_response(response):
     elif bms_pv:
       packet['bms_params'][bms_pv],response = decode_num(response, coef, num_sz)
     elif code == 0xb2:
-        bms_pwd, response = decode_str(response, 10)
-        print(f"BMS PWD: {bms_pwd}")
+        _, response = decode_str(response, 10)   # the BMS password is never printed or logged
+        global pwd_noted
+        if not pwd_noted:   # the BMS repeats it in every poll: say so once per run, not on every packet
+            pwd_noted = True
+            log.debug("BMS returned its password; value is intentionally not logged")
     elif code == 0xb4:
         packet['device_id'], response = decode_str(response, 8)
     elif code == 0xb5:
