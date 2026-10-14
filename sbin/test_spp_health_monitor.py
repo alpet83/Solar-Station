@@ -153,5 +153,29 @@ class T(unittest.TestCase):
         self.assertIn('value=0&flags=0', url); self.assertEqual(body, 'a\\nb')
 
 
+    def test_wifi_fallback_and_route(self):
+        io = FakeIO(); mon, d = mk(io, net={'ifaces': ['eth0'], 'wifi': 'wlan0'})
+        route = 'Iface\tDestination\tGateway\n%s\t00000000\t0100A8C0\n'
+        io.files['/sys/class/net/wlan0/operstate'] = 'up\n'
+        io.files['/proc/net/route'] = (route % 'eth0') + (route % 'wlan0').split('\n', 1)[1]
+        self.assertNotIn('net:wifi', mon.step()); self.assertNotIn('net:route', mon.step())
+        io.files['/proc/net/route'] = route % 'eth0'              # wlan0 has no default route
+        self.assertIn('net:wifi', mon.step())
+        io.files['/proc/net/route'] = 'Iface\tDestination\tGateway\n'   # no route at all
+        pr = mon.step(); self.assertIn('net:route', pr); self.assertEqual(pr['net:route'][0], 'alert')
+        io.files['/sys/class/net/wlan0/operstate'] = 'down\n'
+        self.assertIn('net:wifi', mon.step())
+
+    def test_feed_freshness(self):
+        io = FakeIO(); mon, d = mk(io, feed={'file': '/tmp/inverter_last.json', 'max_age_s': 300})
+        mt = {}
+        io.mtime = lambda p: mt.get(p)
+        self.assertIn('feed:stale', mon.step())                    # no file
+        mt['/tmp/inverter_last.json'] = io.now() - 10
+        self.assertNotIn('feed:stale', mon.step())
+        io.advance(400)
+        self.assertIn('feed:stale', mon.step())
+
+
 if __name__ == '__main__':
     unittest.main()

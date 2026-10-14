@@ -37,7 +37,8 @@ DEFAULTS = {
     'usb': {'enabled': True, 'window_s': 120, 'min_errors': 5, 'recovery_cmd': '/usr/sbin/usb_recovery.sh',
             'cooldown_s': 600, 'max_per_hour': 3, 'expect_devices': []},
     'board': {'url': '', 'silent_s': 300, 'grid_min_v': 180.0, 'offgrid_alert_v': 49.0, 'offgrid_s': 120},
-    'net': {'ifaces': ['eth0']},
+    'net': {'ifaces': ['eth0'], 'wifi': '', 'need_route': True},
+    'feed': {'file': '', 'max_age_s': 300},
     'pi': {'temp_c': 80, 'disk_free_pct': 10},
 }
 USB_PATTERNS = [re.compile(p) for p in (
@@ -73,6 +74,9 @@ class IO:
         except OSError:
             return None
     def exists(self, path): return os.path.exists(path)
+    def mtime(self, path):
+        try: return os.path.getmtime(path)
+        except OSError: return None
     def http_get(self, url, timeout=8):
         with urllib.request.urlopen(url, timeout=timeout) as f: return f.read().decode('utf-8', 'replace')
     def http_post(self, url, data, timeout=15):
@@ -274,7 +278,31 @@ class Monitor:
         for i in self.c['net']['ifaces']:
             s = (self.io.read('/sys/class/net/%s/operstate' % i) or '').strip()
             if s and s != 'up': problems['net:' + i] = ('warn', 'интерфейс %s: %s' % (i, s))
-        return problems, 'net' if self.c['net']['ifaces'] else None
+        n = self.c['net']
+        routes = self.io.read('/proc/net/route')
+        ifaces_with_default = None
+        if routes is not None:
+            ifaces_with_default = {ln.split()[0] for ln in routes.splitlines()[1:] if len(ln.split()) > 2 and ln.split()[1] == '00000000'}
+        w = n.get('wifi')
+        if w:    # eth0 dies together with the USB bus, so Wi-Fi is the main channel for alerts
+            s = (self.io.read('/sys/class/net/%s/operstate' % w) or '').strip()
+            if s and s != 'up':
+                problems['net:wifi'] = ('warn', 'резервный Wi-Fi %s: %s (при отвале eth0 связи не будет)' % (w, s))
+            elif ifaces_with_default is not None and w not in ifaces_with_default:
+                problems['net:wifi'] = ('warn', 'у Wi-Fi %s нет маршрута по умолчанию' % w)
+        if n.get('need_route') and ifaces_with_default is not None and not ifaces_with_default:
+            problems['net:route'] = ('alert', 'нет маршрута по умолчанию: малина без связи, оповещения копятся в очереди')
+        return problems, 'net' if (n['ifaces'] or w) else None
+
+    def check_feed(self):
+        f = self.c['feed']
+        if not f['file']: return {}, None
+        mt = self.io.mtime(f['file'])
+        age = None if mt is None else self.io.now() - mt
+        if age is None or age > f['max_age_s']:
+            what = 'нет файла' if age is None else 'старше %d мин' % (age / 60)
+            return {'feed:stale': ('warn', 'данные для Home Assistant не обновляются (%s: %s)' % (f['file'], what))}, 'feed'
+        return {}, 'feed'
 
     def check_pi(self):
         p, problems = self.c['pi'], {}
@@ -300,7 +328,7 @@ class Monitor:
     # -- main
     def step(self):
         problems, ran = {}, set()
-        for chk in (self.check_usb, self.check_services, self.check_board, self.check_net, self.check_pi):
+        for chk in (self.check_usb, self.check_services, self.check_board, self.check_net, self.check_feed, self.check_pi):
             try:
                 pr, r = chk()
             except Exception as e:

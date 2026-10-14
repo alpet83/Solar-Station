@@ -11,6 +11,7 @@
     "expect_devices": []
   },
   "board": {"url": "http://grid-supervisor.local", "silent_s": 300, "offgrid_alert_v": 49.0, "offgrid_s": 120},
-  "net": {"ifaces": ["eth0"]},
+  "net": {"ifaces": ["eth0"], "wifi": "wlan0", "need_route": true},
+  "feed": {"file": "/tmp/inverter_last.json", "max_age_s": 300},
   "pi": {"temp_c": 80, "disk_free_pct": 10}
 }

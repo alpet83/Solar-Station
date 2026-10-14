@@ -47,6 +47,8 @@ SUP_RETRY_S = 60          # after a board failure try the tap first for this lon
 sup_fail_t = 0.0
 tap_warned = set()
 sup = None
+# No RS485 adapter (DEVICE absent) and no supervisor config: registers only from the datalogger tap, no writes.
+tap_only = False
 
 prev_state = {'w': 0, 'inv_curr': 0, 'grid_curr': 0, 'load_curr': 0}
 
@@ -110,6 +112,8 @@ def tap_read_regs(addr, count):
 def read_regs(addr, count):
     global sup_fail_t
     rr = None
+    if tap_only:
+        return tap_read_regs(addr, count)
     if sup:
         if time.time() - sup_fail_t < SUP_RETRY_S:
             try:
@@ -278,7 +282,11 @@ def process_cmd(cmd):
             now = datetime.now()
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
             # note: contrary to protocol documentation 10001-10008 is read-only registers
-            if sup and addr != 20105:
+            if tap_only:
+                print(f"#ERROR: write to {addr} is not supported without the board (tap-only mode)")
+                with open(CMD_FILE + '.log', "a") as cmdl:
+                    cmdl.write(f"[{ts}] {cmd} ignored (tap-only mode, no write path)\n")
+            elif sup and addr != 20105:
                 print(f"#ERROR: write to {addr} is not supported in supervisor mode")
                 with open(CMD_FILE + '.log', "a") as cmdl:
                     cmdl.write(f"[{ts}] {cmd} ignored (supervisor mode allows only 20105)\n")
@@ -366,14 +374,19 @@ def read_loop():
         f.write(jss)
 
     data['config'] = map_values(registers, config_params)
-    registers = read_regs(10001, 8)
-    chgc = map_values(registers, charger_params)
-    sn = registers[1] * 0x10000 + registers[2]
-    chgc['serial'] = f"{sn:08x}"
-    registers = read_regs(10101, 23)  # charging voltages, 10009-10100 is reserved
-    battp = map_values(registers, batt_params)
-    chgc.update(battp)
-    data['chg_config'] = chgc
+    try:
+        registers = read_regs(10001, 8)
+        chgc = map_values(registers, charger_params)
+        sn = registers[1] * 0x10000 + registers[2]
+        chgc['serial'] = f"{sn:08x}"
+        registers = read_regs(10101, 23)  # charging voltages, 10009-10100 is reserved
+        battp = map_values(registers, batt_params)
+        chgc.update(battp)
+        data['chg_config'] = chgc
+    except AssertionError as e:
+        if not (tap_only or sup_fail_t):
+            raise
+        log.warning(f"charger config unavailable in fallback mode, skipped: {e}")
     jss = json.dumps(data)
     print(f'#CONFIG {jss}')
     with open('/tmp/inverter_cfg.json', 'w') as f:
@@ -432,11 +445,20 @@ def using_mini():
 if __name__ == "__main__":
     time.sleep(1)  # datalogger conflict prevention with crontab usage
     #
-    if load_supervisor():
-        print("#DBG: supervisor mode, registers from " + sup['url'])
-        regs = read_regs(ADDR, 1)
-        if regs and regs[0] == PV1800_ID:
-            read_loop()
+    if not load_supervisor() and not os.path.exists(DEVICE):
+        # no adapter: never open/initialize the serial port, work from the datalogger tap only
+        tap_only = True
+        print(f"#DBG: {DEVICE} not found and no {SUPERVISOR_CONF}: tap-only mode, registers from {TAP_REGS_FILE}")
+    if sup or tap_only:
+        if sup:
+            print("#DBG: supervisor mode, registers from " + sup['url'] + (", " + DEVICE + " absent" if not os.path.exists(DEVICE) else ""))
+        try:
+            regs = read_regs(ADDR, 1)
+            if regs and regs[0] == PV1800_ID:
+                read_loop()
+        except AssertionError as e:
+            print(f"#ERROR: no data source: {e}")
+            sys.exit(1)
     elif not using_pymodbus():
         using_mini()
 
