@@ -771,9 +771,10 @@ CONFIG_DEFAULTS = dict(GUARD_DEFAULTS, **{
     'listen': ('0.0.0.0', 502), 'upstream': None, 'dns': ('8.8.8.8', 53), 'log': None,
     'max_hex': 64, 'burst_gap': 3.0, 'heuristic': False, 'guard': True, 'guard_dry_run': False,
     'handler_args': None, 'tracker': True, 'cycle_gap_s': 10.0, 'state_file': None,
+    'regs_file': None,
 })
 # ключи, принимающие null (= не задано)
-CONFIG_NULLABLE = {'upstream', 'log', 'host', 'handler_args', 'state_file', 'alert_webhook_url', 'alert_webhook_body',
+CONFIG_NULLABLE = {'upstream', 'log', 'host', 'handler_args', 'state_file', 'regs_file', 'alert_webhook_url', 'alert_webhook_body',
                    'alert_webhook_error_text'}
 # 'enabled' - прежнее имя ключа 'guard' (guard имеет приоритет)
 CONFIG_KNOWN = set(CONFIG_DEFAULTS) | {'enabled'}
@@ -825,7 +826,7 @@ def validate_config(user):
             if not isinstance(v, str) or not v:
                 raise ConfigError('dns: ожидается строка "HOST" или "HOST:PORT", получено %r' % (v,))
             v = _hostport(k, v, 0) if ':' in v else (v, 53)
-        elif k in ('log', 'host', 'handler', 'state_file', 'alert_webhook_content_type', 'alert_webhook_error_text'):
+        elif k in ('log', 'host', 'handler', 'state_file', 'regs_file', 'alert_webhook_content_type', 'alert_webhook_error_text'):
             if not isinstance(v, str) or not v:
                 raise ConfigError('%s: ожидается непустая строка, получено %r' % (k, v))
         elif k in ('alert_webhook_url', 'alert_webhook_body'):
@@ -1007,6 +1008,32 @@ def load_handler(spec):
     return fn, spec
 
 
+class RegCache:
+    """Последние ответы инвертора по блокам (стартовый адрес -> (epoch, слова)) в JSON для pv1800_ctrl.py:
+    запасной источник данных, если плата grid-supervisor недоступна (см. sbin/gs_tapregs.py).
+    put() только запоминает; запись раз в секунду из тикера, чтобы не тормозить проксирование."""
+
+    def __init__(self, path, wall=time.time):
+        self.path, self.wall = path, wall
+        self.blocks = {}
+        self.dirty = False
+
+    def put(self, addr, regs):
+        self.blocks[addr] = (self.wall(), [int(x) for x in regs])
+        self.dirty = True
+
+    def snapshot(self):
+        return {'t': max((t for t, _ in self.blocks.values()), default=0),
+                'blocks': [{'addr': a, 'count': len(r), 't': t, 'regs': r} for a, (t, r) in sorted(self.blocks.items())]}
+
+    def flush(self, force=False):
+        if not self.dirty and not force:
+            return False
+        self.dirty = False
+        write_state_file(self.path, self.snapshot())
+        return True
+
+
 class GuardRunner:
     """Связка Guard с asyncio: очередь событий, последовательные вызовы обработчика в потоке с
     таймаутом, периодический tick. Любая ошибка логируется и не влияет на проксирование."""
@@ -1024,8 +1051,11 @@ class GuardRunner:
         self.guard = Guard(gcfg, notify=notify)
         self.tracker = None
         self.state_file = cfg.get('state_file')
+        self.regs = RegCache(cfg['regs_file'], wall) if cfg.get('regs_file') else None
         if cfg.get('tracker', False):            # без ключа (старые вызовы) трекер выключен
             self.tracker = CycleTracker(cfg.get('cycle_gap_s', 10.0), clock, wall)
+            self.guard.observer = self
+        if self.regs is not None:
             self.guard.observer = self
         self.handler = handler
         self.queue = None
@@ -1049,21 +1079,34 @@ class GuardRunner:
         self.tasks = [loop.create_task(self._worker()), loop.create_task(self._ticker())]
         if self.tracker is not None:
             self.tasks.append(loop.create_task(self._tracker_ticker()))
+        if self.regs is not None:
+            self.tasks.append(loop.create_task(self._regs_ticker()))
 
     async def stop(self):
         for t in self.tasks:
             t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks = []
+        if self.regs is not None:
+            try:
+                self.regs.flush(force=True)
+            except Exception as e:
+                self.log.line('REGS-ERROR final flush %s: %r' % (self.regs.path, e))
 
     # --- трекер ритма опроса (ошибки не влияют на проксирование) ---
     def on_request(self, now, addr, cnt):
+        if self.tracker is None:
+            return
         try:
             self._cycle_closed(self.tracker.request(now, addr, cnt))
         except Exception as e:
             self.log.line('TRACKER-ERROR request: %r' % e)
 
     def on_response(self, now, addr, regs):
+        if self.regs is not None:
+            self.regs.put(addr, regs)
+        if self.tracker is None:
+            return
         try:
             self.tracker.response(now, addr, regs)
         except Exception as e:
@@ -1078,6 +1121,14 @@ class GuardRunner:
                 write_state_file(self.state_file, self.tracker.state(self.clock()))
             except Exception as e:
                 self.log.line('TRACKER-ERROR state_file %s: %r' % (self.state_file, e))
+
+    async def _regs_ticker(self):
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                self.regs.flush()
+            except Exception as e:
+                self.log.line('REGS-ERROR flush %s: %r' % (self.regs.path, e))
 
     async def _tracker_ticker(self):
         step = max(0.05, min(1.0, self.tracker.gap / 3))
@@ -1190,7 +1241,8 @@ def build_guard_runner(args, log):
         cfg['guard'] = cfg.get('enabled', True)
         cfg['guard_dry_run'] = bool(getattr(args, 'guard_dry_run', False))
     guard, tracker = bool(cfg.get('guard')), bool(cfg.get('tracker', False))
-    if not guard and not tracker:
+    regs = bool(cfg.get('regs_file'))
+    if not guard and not tracker and not regs:
         log.line('GUARD disabled by config')
         return None
     if guard:
@@ -1198,6 +1250,8 @@ def build_guard_runner(args, log):
                  % (cfg['warn_v'], cfg['alert_v'], cfg['clear_v'], cfg['consecutive'], cfg['host']))
     else:
         log.line('GUARD disabled by config (tracker only)')
+    if regs:
+        log.line('REGS cache enabled regs_file=%s' % cfg.get('regs_file'))
     if tracker:
         log.line('TRACKER enabled cycle_gap_s=%s state_file=%s' % (cfg.get('cycle_gap_s'), cfg.get('state_file')))
     return GuardRunner(cfg, log, dry_run=bool(cfg.get('guard_dry_run')), notify=guard)

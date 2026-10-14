@@ -27,5 +27,6 @@
 
   "tracker": true,
   "cycle_gap_s": 10,
-  "state_file": "/run/eybond-tap/cycle.json"
+  "state_file": "/run/eybond-tap/cycle.json",
+  "regs_file": "/run/eybond-tap/regs.json"
 }

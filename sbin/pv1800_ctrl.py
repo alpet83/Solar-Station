@@ -10,6 +10,9 @@ from pymodbus.framer import ModbusRtuFramer
 # for pymodbus 3.8.0 uncomment next and remove line above
 # from pymodbus.framer import FramerRTU
 from datetime import datetime
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gs_tapregs   # fallback source: registers seen by eybond_tap (see sbin/gs_tapregs.py)
 import logging
 FORMAT = ('%(asctime)-15s %(threadName)-15s '
           '%(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s')
@@ -36,6 +39,13 @@ SUPERVISOR_CONF = '/etc/gs-supervisor.conf'
 SUP_FAST_BLOCKS = (15201, 25201, 20101)   # must be fresh; other blocks are slow-polled static data
 SUP_FAST_MAX_AGE_MS = 60000
 SUP_SLOW_MAX_AGE_MS = 900000
+# Fallback when the board is unreachable: registers from the datalogger's own polling, cached by eybond_tap
+# (eybond-tap.conf: "regs_file"). Read-only: commands still go only through the board.
+TAP_REGS_FILE = '/run/eybond-tap/regs.json'
+TAP_MAX_AGE_S = 300
+SUP_RETRY_S = 60          # after a board failure try the tap first for this long
+sup_fail_t = 0.0
+tap_warned = set()
 sup = None
 
 prev_state = {'w': 0, 'inv_curr': 0, 'grid_curr': 0, 'load_curr': 0}
@@ -83,10 +93,39 @@ def sup_read_regs(addr, count):
     raise AssertionError(f"#FATAL: can't read registers {count}@{addr} from supervisor")
 
 
+def tap_read_regs(addr, count):
+    snap = gs_tapregs.load(TAP_REGS_FILE)
+    if snap is None:
+        raise AssertionError(f"tap: {TAP_REGS_FILE} unavailable")
+    try:
+        regs, missing = gs_tapregs.assemble(snap, addr, count, time.time(), TAP_MAX_AGE_S, fill={ADDR: PV1800_ID})
+    except LookupError as e:
+        raise AssertionError(f"tap: {e}")
+    if missing and (addr, count) not in tap_warned:
+        tap_warned.add((addr, count))
+        log.warning(f"tap: {count}@{addr} incomplete, registers not polled by the datalogger filled with 0: {missing}")
+    return regs
+
+
 def read_regs(addr, count):
+    global sup_fail_t
     rr = None
     if sup:
-        return sup_read_regs(addr, count)
+        if time.time() - sup_fail_t < SUP_RETRY_S:
+            try:
+                return tap_read_regs(addr, count)
+            except AssertionError:
+                pass          # the tap has nothing usable either: try the board again
+        try:
+            regs = sup_read_regs(addr, count)
+            if sup_fail_t:
+                log.warning("board is back, using supervisor registers again")
+                sup_fail_t = 0.0
+            return regs
+        except AssertionError as e:
+            sup_fail_t = time.time()
+            log.warning(f"board unavailable ({e}), falling back to the datalogger tap")
+            return tap_read_regs(addr, count)
     time.sleep(0.3)  # tx separation delay
     if client:
         for attempt in range(5):
