@@ -13,7 +13,7 @@ try:
     from pymodbus.client import ModbusSerialClient as ModbusClient
 except ImportError:
     ModbusClient = None
-from datetime import datetime
+from datetime import datetime, timezone
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gs_tapregs   # fallback source: registers seen by eybond_tap (see sbin/gs_tapregs.py)
@@ -214,7 +214,8 @@ def calc_pf(data, key):
 
 def scan_realtime():
     data = {}
-    now = datetime.now()
+    # ts is UTC (like jkbms_ctrl.py): mqtt-client.php parses it as UTC, a local-time ts made the data look outdated
+    now = datetime.now(timezone.utc)
     data['ts'] = now.strftime("%Y-%m-%d %H:%M:%S")
     registers = read_regs(15201, 22)
     if registers:
