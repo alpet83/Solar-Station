@@ -10,13 +10,18 @@
     use PhpMqtt\Client\MqttClient;
     # use Psr\Log\LogLevel;
 
-    $server   = 'rpi3-ha.local'; // here you can select target
+    date_default_timezone_set('UTC');
+
+    $server   = 'rpi5-ha.local'; // here you can select target
     $port     = 1883;
     $clientId = 'SolarStation';
     # $logger = new SimpleLogger(LogLevel::INFO);
-    define('OUTDATED_TRESH', 1);
+    define('OUTDATED_TRESH', 5);
+    define('MQTT_RECONNECT_ATTEMPTS', 3);
+    define('MQTT_RECONNECT_DELAY_SECONDS', 5);
     define('SENSOR_PATH', 'homeassistant/sensor/solar_station');
     define('SWITCH_PATH', 'homeassistant/switch/solar_station');
+    define('CREDS_FILE', '/etc/MQTT_creds');
 
     $root = SENSOR_PATH;
 
@@ -112,33 +117,49 @@
     $MPPT_st_desc = ['Stop', 'MPPT', 'Current limiting'];
 
     $inv_cfg = null;
+    $utc = new DateTimeZone('UTC');
 
-    // Age of a data file in minutes. Taken from the file's mtime, so it does not depend on the time zone the
-    // producer wrote `ts` in (pv1800_ctrl/jkbms_ctrl write UTC, epever_dump uses the local zone). A mismatch with
-    // the ts-based age is reported once per file as a hint that some producer writes ts in a different zone.
-    $age_warned = [];
-    function data_age_min(string $file, $ts): float {
-        global $age_warned;
-        clearstatcache(true, $file);
-        $mt = @filemtime($file);
-        $ts_age = abs((float)diff_minutes('now', $ts));
-        if ($mt === false) return $ts_age;
-        $age = max(0.0, (time() - $mt) / 60.0);
-        if (abs($ts_age - $age) > 5 && empty($age_warned[$file])) {
-            $age_warned[$file] = true;
-            log_cmsg(sprintf("~C93#WARN:~C00 %s: ts says %.0f min old, file mtime says %.1f min (ts time zone differs from UTC?), using mtime", $file, $ts_age, $age));
+    /**
+     * Replace a broken MQTT connection without stopping collection for the
+     * rest of the hour. The broker may close an idle TCP socket at any time.
+     */
+    function reconnect_mqtt(?MqttClient $previous, ConnectionSettings $settings): ?MqttClient {
+        global $server, $port, $clientId;
+
+        if ($previous) {
+            try {
+                $previous->disconnect();
+            } catch (Throwable $ignored) {
+                // The socket is already unusable; creating a new client is enough.
+            }
         }
-        return $age;
+
+        for ($attempt = 1; $attempt <= MQTT_RECONNECT_ATTEMPTS; $attempt++) {
+            try {
+                $replacement = new MqttClient($server, $port, $clientId, MqttClient::MQTT_3_1, null);
+                $replacement->connect($settings, true);
+                log_cmsg("~C92#MQTT:~C00 reconnected on attempt %d", $attempt);
+                return $replacement;
+            } catch (MqttClientException $e) {
+                log_cmsg("~C91#MQTT:~C00 reconnect attempt %d/%d failed: %s", $attempt, MQTT_RECONNECT_ATTEMPTS, $e->getMessage());
+                if ($attempt < MQTT_RECONNECT_ATTEMPTS)
+                    sleep(MQTT_RECONNECT_DELAY_SECONDS);
+            }
+        }
+        return null;
     }
             
     function publish_bms() {
-        global $mqtt, $root, $sws_desc, $bms_ts;
+        global $mqtt, $root, $sws_desc, $bms_ts, $utc;
         $bms = file_load_json('/tmp/jkbms_last.json');
-        $elps = data_age_min('/tmp/jkbms_last.json', $bms->ts);
+        $elps = diff_minutes('now', $bms->ts, $utc);
         if ($bms->ts == $bms_ts) return; // already send
          
         if ($elps > OUTDATED_TRESH) {
-            log_cmsg("~C91#ERROR:~C00 JKBMS last outdated for $elps minutes");
+            if (gmdate('now') != date('now'))
+                log_cmsg("~C91#WARN:~C00 script required UTC global timezone");
+
+            log_cmsg("~C91#ERROR:~C00 JKBMS last outdated for $elps minutes = %s", $bms->ts);
             return;
         }   
         $max_v = 0;
@@ -156,14 +177,41 @@
                                 'state_of_charge' => $bms->battery_SoC]);
         log_cmsg("~C97#PUB:~C00 $json");
         $mqtt->publish(SENSOR_PATH."_jkbms/state", $json);
-        
         $json = json_encode(['balance_sw' => $sws_desc[$par->balance_switch], 'charge_MOS_sw' => $sws_desc[$par->chg_MOS_switch], 'discharge_MOS_sw' => $sws_desc[$par->dis_MOS_switch]]);
         log_cmsg("~C97#PUB:~C00 $json");
         $mqtt->publish(SWITCH_PATH."_jkbms/state", $json);
         $bms_ts = $bms->ts;
     }   
+    function publish_epever() {
+        global $mqtt, $root, $sws_desc, $epever_ts, $utc;
+        $rec  = file_load_json('/tmp/epever_dump.json', null, true);
+        $dts = $rec['device_ts'];
+        $elps = diff_minutes('now', $dts, $utc);
+        if ($dts == $epever_ts) return; // already send
+        if ($elps > OUTDATED_TRESH) {
+            if (gmdate('now') != date('now'))
+                log_cmsg("~C91#WARN:~C00 script required UTC global timezone");
+
+            log_cmsg("~C91#ERROR:~C00 Epever last outdated for %d minutes = %s", $elps, $dts);
+            file_add_contents('/tmp/epever_cmd', "clock_sync\n");
+            return;
+        }
+
+        unset($rec['ts']);
+        $json = json_encode($rec);
+        log_cmsg("~C97#PUB:~C00 $json");
+        $mqtt->publish(SENSOR_PATH."_epever/state", $json);
+        $epever_ts = $dts;
+
+        /*
+        $json = json_encode(['balance_sw' => $sws_desc[$par->balance_switch], 'charge_MOS_sw' => $sws_desc[$par->chg_MOS_switch], 'discharge_MOS_sw' => $sws_desc[$par->dis_MOS_switch]]);
+        log_cmsg("~C97#PUB:~C00 $json");
+        $mqtt->publish(SWITCH_PATH."_epever/state", $json);
+        // */
+    }
+
     function publish_inverter() {
-        global $mqtt, $root, $sws_desc, $inv_cfg, $pvc_ws_desc, $chg_st_desc, $MPPT_st_desc, $inv_ts, $minute;
+        global $mqtt, $root, $sws_desc, $inv_cfg, $pvc_ws_desc, $chg_st_desc, $MPPT_st_desc, $inv_ts, $minute, $utc;
         $inv = file_load_json('/tmp/inverter_last.json');
         if (!is_object($inv)) {
             log_cmsg("~C91#ERROR:~C00 can't load invertor data");
@@ -171,7 +219,7 @@
         }
         if ($inv->ts == $inv_ts) return;
 
-        $elps = data_age_min('/tmp/inverter_last.json', $inv->ts);
+        $elps = diff_minutes('now', $inv->ts, $utc);
         if ($elps > OUTDATED_TRESH) {
             log_cmsg("~C91#ERROR:~C00 Inverter last outdated for $elps minutes");
             return;
@@ -249,20 +297,23 @@
         }
         log_cmsg("~C93#DBG:~C00 switch_set~C92 $topic~C95 =>~C92 $message~C00");
         $addr = $addrs[$id];
-        $val = (strpos($message, 'ON') !== false) ? 1 : 0;
+        $val = (strpos($message, 'ON') !== false) ? 1 : 0;   // a bool would be written as '' for OFF
         file_put_contents('/root/inverter_cmd.lst', "$addr=>$val\n", FILE_APPEND);
     } // on_switch_set
 
 
     $bms_ts = '';
     $inv_ts = '';
+    $epever_ts = '';
     $creds = 'user password';
     $minute = date('i');
 
     try {        
         $mqtt = new MqttClient($server, $port, $clientId, MqttClient::MQTT_3_1, null);
         if ($argc > 1) {
-           $creds = file_get_contents('/etc/MQTT_creds');
+           if (!file_exists(CREDS_FILE))
+                die("#FATAL: not exists required credential file ".CREDS_FILE);
+           $creds = file_get_contents(CREDS_FILE);
            $creds = trim($creds);
         }   
         list($user, $pass) = explode(' ', $creds);
@@ -302,8 +353,41 @@
         $root = SWITCH_PATH.'_jkbms';
         
         $factory->publish($mqtt); // update hourly
+        // =================================== EPEVER ================================
+        $factory = new MQTTConfigFactory('epever_sensor.json', 'Epever_MPPT');
+        $root = SENSOR_PATH.'_epever';
 
+        $factory->add('battery_SOC', 'Battery State of Charge')
+                ->add('charging_status', 'Charging status')
+                ->add('discharging_status', 'Discharging status');
 
+        $factory->set_device('voltage');
+        $factory->add('array_input_voltage', 'PV voltage')
+                ->add('battery_voltage', 'Battery voltage')
+                ->add('battery_rated_voltage', 'Battery rated voltage')
+                ->add('load_voltage', 'Load voltage');
+        $factory->set_device('current');
+        $factory->add('array_input_current', 'PV current')
+                ->add('battery_current', 'Battery current')
+                ->add('battery_rated_current', 'Battery rated current')
+                ->add('load_current', 'Load current');
+
+        $factory->set_device('power');
+        $factory->add('array_input_power', 'PV power')
+                ->add('battery_power', 'Battery power')
+                ->add('load_power', 'Load power');
+
+        $factory->set_device('energy');
+        $factory->add("generated_energy_today", "Generated energy today")
+                ->add("generated_energy_month", "Generated energy month")
+                ->add("generated_energy_year", "Generated energy year")
+                ->add("generated_energy_total", "Generated energy total")
+                ->add("consumed_energy_today", "Consumed energy today")
+                ->add("consumed_energy_month", "Consumed energy month")
+                ->add("consumed_energy_year", "Consumed energy year")
+                ->add("consumed_energy_total", "Consumed energy total");
+
+        $factory->publish($mqtt);
 
         // =================================== INVERTER ================================
 
@@ -382,16 +466,32 @@
         
 
         while ($minute < 59) {
-            // log_cmsg("~C92 #DBG:~C00 trying send test...");         
-            $inv_cfg = file_load_json('/tmp/inverter_cfg.json');
-            publish_bms();
-            publish_inverter();
-            $mqtt->loopOnce(microtime(true), true);            
+            if (!$mqtt) {
+                // Keep the long-running collector alive while the broker or
+                // network is restarting; the next iteration retries again.
+                sleep(MQTT_RECONNECT_DELAY_SECONDS);
+                $mqtt = reconnect_mqtt(null, $connectionSettings);
+                $minute = date('i');
+                continue;
+            }
+            try {
+                // log_cmsg("~C92 #DBG:~C00 trying send test...");
+                $inv_cfg = file_load_json('/tmp/inverter_cfg.json');
+                publish_bms();
+                publish_epever();
+                publish_inverter();
+                $mqtt->loopOnce(microtime(true), true);
+            } catch (MqttClientException $e) {
+                log_cmsg("~C91#MQTT:~C00 connection lost: %s", $e->getMessage());
+                $mqtt = reconnect_mqtt($mqtt, $connectionSettings);
+                if (!$mqtt)
+                    log_cmsg("~C91#MQTT:~C00 reconnect series failed; will retry while this run remains active");
+            }
             $minute = date('i');
         }    
-        $mqtt->disconnect();        
+        if ($mqtt)
+            $mqtt->disconnect();
     }  catch (MqttClientException $e) {
         // MqttClientException is the base exception of all exceptions in the library. Catching it will catch all MQTT related exceptions.        
-        log_cmsg('~C91 #EXCEPTION:~C00  %s, trace:\n %s', $e->getMessage(), $e->getTraceAsString());
-        print_r(getenv());
+        log_cmsg('~C91 #MQTT:~C00 startup failed: %s', $e->getMessage());
     }
