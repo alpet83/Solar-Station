@@ -112,11 +112,29 @@
     $MPPT_st_desc = ['Stop', 'MPPT', 'Current limiting'];
 
     $inv_cfg = null;
+
+    // Age of a data file in minutes. Taken from the file's mtime, so it does not depend on the time zone the
+    // producer wrote `ts` in (pv1800_ctrl/jkbms_ctrl write UTC, epever_dump uses the local zone). A mismatch with
+    // the ts-based age is reported once per file as a hint that some producer writes ts in a different zone.
+    $age_warned = [];
+    function data_age_min(string $file, $ts): float {
+        global $age_warned;
+        clearstatcache(true, $file);
+        $mt = @filemtime($file);
+        $ts_age = abs((float)diff_minutes('now', $ts));
+        if ($mt === false) return $ts_age;
+        $age = max(0.0, (time() - $mt) / 60.0);
+        if (abs($ts_age - $age) > 5 && empty($age_warned[$file])) {
+            $age_warned[$file] = true;
+            log_cmsg(sprintf("~C93#WARN:~C00 %s: ts says %.0f min old, file mtime says %.1f min (ts time zone differs from UTC?), using mtime", $file, $ts_age, $age));
+        }
+        return $age;
+    }
             
     function publish_bms() {
         global $mqtt, $root, $sws_desc, $bms_ts;
         $bms = file_load_json('/tmp/jkbms_last.json');
-        $elps = diff_minutes('now', $bms->ts);
+        $elps = data_age_min('/tmp/jkbms_last.json', $bms->ts);
         if ($bms->ts == $bms_ts) return; // already send
          
         if ($elps > OUTDATED_TRESH) {
@@ -153,7 +171,7 @@
         }
         if ($inv->ts == $inv_ts) return;
 
-        $elps = diff_minutes('now', $inv->ts);
+        $elps = data_age_min('/tmp/inverter_last.json', $inv->ts);
         if ($elps > OUTDATED_TRESH) {
             log_cmsg("~C91#ERROR:~C00 Inverter last outdated for $elps minutes");
             return;
