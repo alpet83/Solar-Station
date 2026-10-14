@@ -156,7 +156,7 @@
         if ($bms->ts == $bms_ts) return; // already send
          
         if ($elps > OUTDATED_TRESH) {
-            if (gmdate('now') != date('now'))
+            if (date_default_timezone_get() !== 'UTC')
                 log_cmsg("~C91#WARN:~C00 script required UTC global timezone");
 
             log_cmsg("~C91#ERROR:~C00 JKBMS last outdated for $elps minutes = %s", $bms->ts);
@@ -189,7 +189,7 @@
         $elps = diff_minutes('now', $dts, $utc);
         if ($dts == $epever_ts) return; // already send
         if ($elps > OUTDATED_TRESH) {
-            if (gmdate('now') != date('now'))
+            if (date_default_timezone_get() !== 'UTC')
                 log_cmsg("~C91#WARN:~C00 script required UTC global timezone");
 
             log_cmsg("~C91#ERROR:~C00 Epever last outdated for %d minutes = %s", $elps, $dts);
