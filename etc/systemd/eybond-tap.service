@@ -23,8 +23,8 @@ DynamicUser=yes
 RuntimeDirectory=eybond-tap
 NoNewPrivileges=yes
 ProtectSystem=strict
-# DynamicUser: лог в /var/log недоступен на запись без User= и прав на файл; при проблемах задайте User=/LogsDirectory=
-ReadWritePaths=/var/log
+# DynamicUser: каталог лога создаёт и отдаёт сервису systemd: /var/log/eybond-tap/ (в конфиге "log": "/var/log/eybond-tap/eybond-tap.log")
+LogsDirectory=eybond-tap
 
 [Install]
 WantedBy=multi-user.target

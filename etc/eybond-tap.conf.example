@@ -2,7 +2,7 @@
   "listen": "0.0.0.0:502",
   "upstream": "ess.eybond.com:502",
   "dns": "8.8.8.8",
-  "log": "/var/log/eybond-tap.log",
+  "log": "/var/log/eybond-tap/eybond-tap.log",
   "max_hex": 64,
   "burst_gap": 3.0,
   "heuristic": false,
