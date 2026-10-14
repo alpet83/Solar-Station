@@ -5,7 +5,7 @@ import json
 import argparse
 import sys
 import serial
-from datetime import datetime
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -33,7 +33,19 @@ read_all = b'\x4E\x57\x00\x13\x00\x00\x00\x00\x06\x03\x00\x00\x00\x00\x00\x00\x6
 # for id=1 b'\x4E\x57\x00\x13\x00\x00\x00\x01\x06\x03\x00\x00\x00\x00\x00\x00\x68\x00\x00\x01*'
 ########################
 
-def format_rqs(cmd, frame_info = '00', rec_num = 0, bms_id = 0):
+def format_rqs(cmd, frame_info='00', rec_num=0, bms_id=0):
+    """Build one JK-BMS RS485 request frame.
+
+    ``rec_num`` and ``bms_id`` are both four-byte fields.  Keep them named
+    arguments at call sites: confusing their order broadcasts a command even
+    when a particular BMS was requested.
+    """
+    if not 0 <= cmd <= 0xff:
+        raise ValueError("command must fit in one byte")
+    if not 0 <= rec_num <= 0xffffffff:
+        raise ValueError("record number must fit in four bytes")
+    if not 0 <= bms_id <= 0xffffffff:
+        raise ValueError("BMS ID must fit in four bytes")
     rqs = bytes()
     bo = 'big'
     rqs += b"NW\x00" # 19 bytes length
@@ -51,6 +63,28 @@ def format_rqs(cmd, frame_info = '00', rec_num = 0, bms_id = 0):
     rqs += crc_high.to_bytes(1, bo)
     rqs += crc_low.to_bytes(1, bo)
     return rqs
+
+
+def parse_hex_value(value):
+    """Validate a CLI value without silently accepting a malformed frame."""
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("VALUE must be an even-length hexadecimal string") from exc
+    return value
+
+
+def uint_arg(maximum, name):
+    """Return an argparse converter for an unsigned bounded integer."""
+    def converter(value):
+        try:
+            number = int(value, 0)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer") from exc
+        if not 0 <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"{name} must be between 0 and {maximum}")
+        return number
+    return converter
 
 bms_params = [[0x8e, 2, "total_OVP", 0.01],
               [0x8f, 2, "total_UVP", 0.01],
@@ -95,14 +129,27 @@ bms_params = [[0x8e, 2, "total_OVP", 0.01],
               [0xb9, 4, "actual_batt_cap", 1],
               [0xc0, 1, "protocol_ver", 1]]
 
+class DecodeError(ValueError):
+    """A truncated or malformed BMS payload."""
+
+
+def require_bytes(response, count, field):
+    if len(response) < count:
+        raise DecodeError(f"truncated {field}: expected {count} bytes, got {len(response)}")
+
+
 def bytes2hex(b):
   return '0x' + b.hex()
           
 def bytes2int(b):  
+  if not b:
+    raise DecodeError("missing numeric value")
   return int(b.hex(), 16) 
 
 def decode_cells(response):
+  require_bytes(response, 2, "cell block header")
   size  = bytes2int(response[1:2]) # chunk size
+  require_bytes(response, size + 2, "cell block")
   ccnt  = size // 3
   cdata = { "count":ccnt, "voltages":{} } 
     
@@ -116,16 +163,19 @@ def decode_cells(response):
   return cdata, response
 
 def decode_str(response, sz = 4, encoding = "utf-8"):
+    require_bytes(response, sz + 1, "string value")
     value = response[1:sz + 1]
     response = response[sz + 1:]
     return value.decode(encoding).rstrip("\x00"), response
 
 def decode_hex(response, sz = 4):
+    require_bytes(response, sz + 1, "hex value")
     value = response[1:sz + 1]
     response = response[sz + 1:]
     return value.hex(), response
 
 def decode_num(response, coef, sz = 1):
+    require_bytes(response, sz + 1, "numeric value")
     value = bytes2int(response[1:sz + 1])
     response = response[sz + 1:]
     return round(value * coef, 3), response
@@ -152,6 +202,7 @@ def decode_current(response):
   return value, response
 
 def decode_temp(response):
+  require_bytes(response, 3, "temperature value")
   temp = bytes2int(response[1:3])
   if temp > 100:
     temp = - (temp - 100) # frozen side
@@ -162,7 +213,9 @@ def decode_response(response):
   """
   Override the default get_responses as its different
   """
-  now = datetime.now()
+  # ``ts`` is the collection timestamp, not the BMS RTC value.  MQTT parses
+  # it as UTC, so it must not inherit the host's local time zone.
+  now = datetime.now(timezone.utc)
   packet = {}
   rlen = len(response)
   if rlen < 16:
@@ -227,7 +280,7 @@ def decode_response(response):
     elif code == 0xb2:
         _, response = decode_str(response, 10)   # the BMS password is never printed or logged
         global pwd_noted
-        if not pwd_noted:   # the BMS repeats it in every poll: say so once per run, not on every packet
+        if not pwd_noted:   # it is repeated in every poll: note it once per run, at DEBUG
             pwd_noted = True
             log.debug("BMS returned its password; value is intentionally not logged")
     elif code == 0xb4:
@@ -257,6 +310,31 @@ def decode_response(response):
   return packet
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Interact with JKBMS by RS485 protocol V2.5')
+    parser.add_argument('--cmd', metavar='CMD', type=uint_arg(6, 'CMD'), default=0,
+                        help='1,2,3,5,6 - activate, write, read, update, read_all')
+    parser.add_argument('--id', metavar='ID', type=uint_arg(0xff, 'ID'), default=0,
+                        help="00, 0x79-0xba - parameter selector for r/w/u")
+    parser.add_argument('--value', metavar='VALUE', type=parse_hex_value, default='',
+                        help="HEX bytes string for rewrite parameter")
+    parser.add_argument('--bms_id', metavar='bms_id', type=uint_arg(0xffffffff, 'bms_id'), default=0,
+                        help="BMS ID on bus, for selection (0 = all)")
+    args = parser.parse_args()
+
+    rqs = read_all
+    save_res = True
+    if 1 <= args.cmd <= 6:
+        save_res = False
+        rqs = format_rqs(
+            args.cmd,
+            f"{args.id:02x}" + args.value,
+            bms_id=args.bms_id,
+        )
+        seconds = time.localtime().tm_sec
+        if seconds < 10:
+            print("collision delay, wait...\n")
+            time.sleep(10 - seconds)
+
     try:
         with serial.serial_for_url(port, baud) as s:
             s.timeout = 1
@@ -266,25 +344,6 @@ if __name__ == "__main__":
             # rqs = format_rqs(3, '\xb1')  # set low capacity alarm level to 30?
             # bytes_written = s.write(rqs)
             # print(f"  write request {rqs}, sent {bytes_written} bytes\n")
-            rqs = read_all
-            parser = argparse.ArgumentParser(description='Interact with JKBMS by RS485 protocol V2.5')
-            parser.add_argument('--cmd', metavar='CMD', type=int, default=0, required=False,
-                                help='1,2,3,5,6 - activate, write, read, update, read_all')
-            parser.add_argument('--id', metavar='ID', type=int, default=0, required=False,
-                                help="00, 0x79-0xba - parameter selector for r/w/u")
-            parser.add_argument('--value', metavar='VALUE', type=str, default='', required=False,
-                                help="HEX bytes string for rewrite parameter")
-            parser.add_argument('--bms_id', metavar='bms_id', type=int, default=0, required=False,
-                                help="BMS ID on bus, for selection (0 = all)")
-            args = parser.parse_args()
-            save_res = True
-            if (args.cmd >= 1) and (args.cmd <= 6):
-                save_res = False
-                rqs = format_rqs(args.cmd, f"{args.id:02x}" + args.value, args.bms_id)
-                seconds = time.localtime().tm_sec
-                if seconds < 10:
-                    print("collision delay, wait...\n")
-                    time.sleep(10 - seconds)
             rqs_hex = rqs.hex()
             print(f"sending command {rqs}:{rqs_hex} ")
             bytes_written = s.write(rqs)
@@ -306,7 +365,11 @@ if __name__ == "__main__":
                     continue
                 rl = len(response)
                 print(f"Got response: {response_line} = {rl}")
-                dec = decode_response(response)
+                try:
+                    dec = decode_response(response)
+                except DecodeError as exc:
+                    log.warning("invalid BMS response: %s", exc)
+                    continue
                 if type(dec) is str:
                     print(f"#WARN(wrong decode): {dec}")
                 else:
@@ -318,19 +381,20 @@ if __name__ == "__main__":
             avg = avg_count.copy()  # init zeros
             count = 0
 
-            for list in accum:
+            for sample in accum:
                 count += 1
-                for key in list.keys():
-                    if (key in avg_params.keys()) and (key in list.keys()):
-                        avg[key] += list[key]
+                for key in sample.keys():
+                    if key in avg_params:
+                        avg[key] += sample[key]
                         avg_count[key] += 1
                     else:
-                        avg[key] = list[key]
+                        avg[key] = sample[key]
 
             if count > 1:
                 print(f" using {count} samples to calc. average values...\n")
                 for key in avg_params.keys():
-                    avg[key] = round(avg[key] / avg_count[key], avg_params[key])  # average samples
+                    if avg_count[key]:
+                        avg[key] = round(avg[key] / avg_count[key], avg_params[key])
             else:
                 print(f"#ERROR: loaded {count} samples")
 
